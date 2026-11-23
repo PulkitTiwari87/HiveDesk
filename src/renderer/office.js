@@ -3,12 +3,17 @@
 // Behaviour is driven by real agent status (nothing is simulated):
 //   starting -> walks in through the door      working -> sits at its desk, typing
 //   idle     -> wanders (cooler, coffee, couch, printer, a colleague's desk)
-//   waiting  -> walks to the human's desk and asks (permission card, bottom-left)
+//   waiting  -> walks into your office and asks (permission card, bottom-left)
+// Rooms: your office, the orchestrator's office and one room per team (a lead and everyone under them).
 //   stopped  -> walks out through the door     exited/error -> slumped at its desk
 // All art is drawn with rectangles, so there are no image assets.
 (function () {
-  const MIN_H = 216, TOP = 34, LEFT = 8, CELL_W = 58, CELL_H = 58, BREAK_W = 74, SPEED = 38;
-  let COLS = 4, CORR_X = LEFT + COLS * CELL_W + 6, W = CORR_X + BREAK_W; // desk columns follow the window width
+  const MIN_H = 216, TOP = 34, LEFT = 8, CELL_W = 58, CELL_H = 58, BREAK_W = 74, SPEED = 38, HEAD = 26, HALL = 18, GAP = 4, PAD = 3; // HEAD leaves room for the name above the first row's speech bubbles
+  let CORR_X = 0, W = 0; // corridor x and world width follow the window
+  // Rooms: your office, the orchestrator's office, then one room per team (a lead and everyone under them).
+  const TEAM_LABEL = { product: 'Product & Design', architect: 'Engineering', security: 'Security (SOC)', deploy: 'Deployment' };
+  const TEAM_ORDER = ['product', 'architect', 'security', 'deploy'];
+  const ROOM_COLORS = ['#f6c445', '#6ea8fe', '#7bd88f', '#ef8a62', '#b190ff', '#5fd3e8', '#f07ab8'];
   const SPOTS = [
     { k: 'cooler', x: 272, y: 52, emote: '\u{1F4A7}' },
     { k: 'coffee', x: 300, y: 52, emote: '☕' },
@@ -30,48 +35,118 @@
     return `rgb(${c(n >> 16)},${c((n >> 8) & 255)},${c(n & 255)})`;
   };
 
-  let box, cv, g, bgCv, tip, asksEl;
+  let box, scroller, cv, g, bgCv, tip, asksEl;
   let dpr = 1, cssW = 0, cssH = 0, S = 2, offX = 0, offY = 0, H = MIN_H;
-  let graph = null, rows = 1, agents = [], handlers = {}, humanAsks = 0;
+  let graph = null, L = { rooms: [], bands: [], pos: [], sig: '' }, agents = [], handlers = {}, humanAsks = 0;
   const chars = new Map();
   const letters = [];
   const lockedUntil = new Map();
   let active = false, raf = 0, last = 0, asksKey = '';
 
   // ---------- layout + walking graph ----------
-  function slotXY(i) {
-    const col = i % COLS, row = Math.floor(i / COLS);
-    return { col, row, cx: LEFT + col * CELL_W + CELL_W / 2, top: TOP + row * CELL_H };
+  // Slot 0 is you; slot i is agents[i - 1]. A room is a lead plus everyone under them (the team).
+  function planRooms(list) {
+    const byId = new Map(list.map((a) => [a.id, a]));
+    const god = list.find((a) => a.isGod);
+    const topOf = (a) => { // climb to the first manager below the orchestrator
+      let cur = a;
+      for (let n = 0; n < 20; n++) {
+        const m = byId.get(cur.reportsTo);
+        if (cur.isGod || !m || m.id === cur.id || m.isGod) return cur;
+        cur = m;
+      }
+      return cur;
+    };
+    const teams = new Map();
+    list.forEach((a, i) => {
+      if (a.isGod) return;
+      const t = topOf(a);
+      if (!teams.has(t.id)) teams.set(t.id, []);
+      teams.get(t.id).push(i + 1);
+    });
+    const rooms = [{ key: 'you', name: 'Your office', slots: [0], human: true }];
+    if (god) rooms.push({ key: 'command', name: `${god.name}'s office`, slots: [list.indexOf(god) + 1] });
+    const named = [], loose = [];
+    for (const [tid, slots] of teams) {
+      const t = byId.get(tid);
+      slots.sort((x, y) => (list[y - 1].id === tid) - (list[x - 1].id === tid)); // the lead sits first
+      if (t.lead || t.presetId || slots.length > 1) named.push({ key: `t_${tid}`, name: TEAM_LABEL[t.presetId] || `${t.name}'s team`, slots, order: TEAM_ORDER.indexOf(t.presetId) });
+      else loose.push(...slots);
+    }
+    named.sort((a, b) => (a.order < 0 ? 99 : a.order) - (b.order < 0 ? 99 : b.order));
+    rooms.push(...named);
+    if (loose.length) rooms.push({ key: 'general', name: 'General', slots: loose });
+    rooms.forEach((r, i) => { r.idx = i; r.color = ROOM_COLORS[i % ROOM_COLORS.length]; });
+    return rooms;
   }
+
+  // Rooms flow left to right in bands; each band has a hallway below its rooms that leads to the corridor.
+  function layout(rooms, ww) {
+    const corr = ww - BREAK_W, avail = corr - LEFT - 8;
+    const maxC = Math.max(2, Math.floor((avail - 2 * PAD) / CELL_W));
+    for (const r of rooms) {
+      const n = r.slots.length;
+      r.cols = Math.max(1, Math.min(r.human ? 2 : n <= 3 ? n : n <= 6 ? 3 : 5, maxC));
+      r.rows = Math.ceil(n / r.cols);
+      r.w = r.cols * CELL_W + 2 * PAD; r.h = HEAD + r.rows * CELL_H + 4;
+    }
+    const bands = [];
+    for (const r of rooms) { // first fit: the first band with space, so small rooms fill gaps
+      let b = bands.find((x) => x.w + GAP + r.w <= avail);
+      if (!b) { b = { rooms: [], w: 0 }; bands.push(b); }
+      r.x = LEFT + b.w + (b.rooms.length ? GAP : 0);
+      b.w += (b.rooms.length ? GAP : 0) + r.w;
+      b.rooms.push(r);
+    }
+    let y = TOP, ok = true;
+    const pos = [];
+    for (const b of bands) {
+      b.h = Math.max(...b.rooms.map((r) => r.h)); b.y = y; b.hall = y + b.h + HALL / 2;
+      if (b.w > avail) ok = false;
+      for (const r of b.rooms) {
+        r.y = y; r.h = b.h; r.band = b;
+        r.slots.forEach((slot, k) => { pos[slot] = { cx: r.x + PAD + (k % r.cols) * CELL_W + CELL_W / 2, top: y + HEAD + Math.floor(k / r.cols) * CELL_H, room: r }; });
+      }
+      y += b.h + HALL;
+    }
+    return { rooms, bands, pos, corr, ww, H: Math.max(MIN_H, y + 4), ok };
+  }
+
+  const slotXY = (i) => L.pos[i] || null;
 
   const bx = (x) => x + CORR_X - 246; // break-area art is authored for a 246px corridor
 
-  function buildGraph(slotCount) {
-    CORR_X = LEFT + COLS * CELL_W + 6; W = CORR_X + BREAK_W;
-    rows = Math.max(1, Math.ceil(slotCount / COLS));
-    H = Math.max(MIN_H, TOP + rows * CELL_H + 10);
+  function buildGraph() {
+    CORR_X = L.corr; W = L.ww; H = L.H;
     const nodes = {}, adj = {};
     const node = (k, x, y) => { nodes[k] = { x, y }; adj[k] = adj[k] || new Set(); };
     const link = (a, b) => { adj[a].add(b); adj[b].add(a); };
     const ys = new Set([30]);
-    for (let r = 0; r < rows; r++) {
-      const ay = TOP + r * CELL_H + 46;
-      ys.add(ay);
-      for (let c = 0; c <= COLS; c++) node(`g${c}_${r}`, LEFT + c * CELL_W, ay);
-      for (let c = 0; c < COLS; c++) {
-        const cx = LEFT + c * CELL_W + CELL_W / 2, i = r * COLS + c;
-        node(`f${i}`, cx, ay);
-        link(`g${c}_${r}`, `f${i}`); link(`f${i}`, `g${c + 1}_${r}`);
-        node(`s${i}`, cx, TOP + r * CELL_H + 28);
-        node(`o${i}`, cx + CELL_W / 2, TOP + r * CELL_H + 28);
-        link(`s${i}`, `o${i}`); link(`o${i}`, `g${c + 1}_${r}`);
+    for (const r of L.rooms) {
+      const gk = (c, row) => `g${r.idx}_${c}_${row}`;
+      for (let row = 0; row < r.rows; row++) {
+        const ay = r.y + HEAD + row * CELL_H + 46;
+        for (let c = 0; c <= r.cols; c++) node(gk(c, row), r.x + PAD + c * CELL_W, ay);
+        if (row) link(gk(0, row - 1), gk(0, row));
+        for (let c = 0; c < r.cols; c++) if (row * r.cols + c >= r.slots.length) link(gk(c, row), gk(c + 1, row)); // empty desk cell
       }
+      r.slots.forEach((slot, k) => {
+        const col = k % r.cols, row = Math.floor(k / r.cols), { cx, top } = L.pos[slot];
+        node(`f${slot}`, cx, top + 46); link(gk(col, row), `f${slot}`); link(`f${slot}`, gk(col + 1, row));
+        node(`s${slot}`, cx, top + 28); node(`o${slot}`, cx + CELL_W / 2, top + 28);
+        link(`s${slot}`, `o${slot}`); link(`o${slot}`, gk(col + 1, row));
+      });
+      node(`rd${r.idx}`, r.x + PAD, r.band.hall); link(gk(0, r.rows - 1), `rd${r.idx}`); // the room's door onto the hallway
+    }
+    for (const b of L.bands) {
+      ys.add(b.hall);
+      for (let i = 1; i < b.rooms.length; i++) link(`rd${b.rooms[i - 1].idx}`, `rd${b.rooms[i].idx}`);
     }
     SPOTS.forEach((s) => ys.add(s.y));
     const sorted = [...ys].sort((a, b) => a - b);
     sorted.forEach((y) => node(`c${y}`, CORR_X, y));
     for (let i = 1; i < sorted.length; i++) link(`c${sorted[i - 1]}`, `c${sorted[i]}`);
-    for (let r = 0; r < rows; r++) link(`g${COLS}_${r}`, `c${TOP + r * CELL_H + 46}`);
+    for (const b of L.bands) link(`rd${b.rooms[b.rooms.length - 1].idx}`, `c${b.hall}`);
     SPOTS.forEach((s) => {
       node(`p_${s.k}_a`, bx(s.x) - 7, s.y); node(`p_${s.k}_b`, bx(s.x) + 7, s.y);
       link(`c${s.y}`, `p_${s.k}_a`); link(`p_${s.k}_a`, `p_${s.k}_b`);
@@ -139,9 +214,9 @@
   }
 
   function askSpot(c) {
-    // Stand beside the human's desk (gaps between desks), never on top of a name label.
-    for (const k of ['g1_0', 'g0_0', 'g2_0', 'g3_0', 'g4_0', 'g5_0']) if (graph.nodes[k] && !targeted(k, c)) return k;
-    return 'g1_0';
+    // Walk into your office and stand beside your desk (aisle gaps), never on top of a name label.
+    for (const k of ['g0_1_0', 'g0_0_0', 'g0_2_0']) if (graph.nodes[k] && !targeted(k, c)) return k;
+    return 'g0_1_0';
   }
 
   function retarget(c, a) {
@@ -165,7 +240,8 @@
     if (c.node !== seat) picks.push(seat, seat);
     SPOTS.forEach((s) => picks.push(freeSpot(c, s)));
     for (const o of chars.values()) {
-      if (o !== c && !o.human && o.mode !== 'leave' && o.slot !== c.slot && !targeted(`f${o.slot}`, c)) picks.push(`f${o.slot}`);
+      const same = L.pos[o.slot] && L.pos[c.slot] && L.pos[o.slot].room.idx === L.pos[c.slot].room.idx; // visit teammates, not other rooms
+      if (o !== c && !o.human && o.mode !== 'leave' && o.slot !== c.slot && same && !targeted(`f${o.slot}`, c)) picks.push(`f${o.slot}`);
     }
     const choices = picks.filter((k) => k !== c.node && graph.nodes[k]);
     if (choices.length) goto(c, choices[Math.floor(Math.random() * choices.length)]);
@@ -249,7 +325,7 @@
         c.dwell -= dt;
         if (c.dwell <= 0) wander(c);
       } else if (c.mode === 'ask') {
-        c.dir = c.x > slotXY(0).cx ? -1 : 1;
+        c.dir = slotXY(0) && c.x > slotXY(0).cx ? -1 : 1;
       }
     }
     for (const [id, c] of [...chars]) if (c.gone) chars.delete(id);
@@ -326,11 +402,29 @@
       for (let i = 0; i < 6; i++) { fb(A[i], 271 + i * 6, H - 26, 4, 7); fb(A[(i + 3) % 6], 271 + i * 6, H - 17, 4, 7); }
     }
     b.restore();
-    plant(8, H - 24);
+    // rooms: tinted floor, walls, a header band for the name, and a doorway onto the hallway
+    for (const bnd of L.bands) fb('#d9ccb0', 4, bnd.y + bnd.h + 3, CORR_X + 2, HALL - 6);
+    for (const r of L.rooms) {
+      box2(r.x, r.y, r.w, r.h, '#ebe1cb', '#6b5a45');
+      b.globalAlpha = 0.18; fb(r.color, r.x + 1, r.y + HEAD, r.w - 2, r.h - HEAD - 1);
+      b.globalAlpha = 1; fb('#fbf3df', r.x + 1, r.y + 1, r.w - 2, HEAD - 2);
+      b.globalAlpha = 0.45; fb(r.color, r.x + 1, r.y + 1, r.w - 2, HEAD - 2);
+      b.globalAlpha = 1; fb('#6b5a45', r.x + 1, r.y + HEAD - 1, r.w - 2, 1);
+      fb('#ebe1cb', r.x + 1, r.y + r.h - 1, 10, 1); fb('#6b5a45', r.x + 11, r.y + r.h - 2, 1, 2); // doorway above the hallway
+    }
+    // your office: bookshelf, sofa and a plant beside your desk
+    const you = L.rooms[0], cx1 = you.x + PAD + CELL_W, t1 = you.y + HEAD;
+    box2(cx1 + 4, t1 + 3, 40, 20, '#9a6a3a', '#5c3d22');
+    const BK = ['#e5484d', '#3b82f6', '#f6c445', '#2fa84f', '#a855f7', '#f08a4b'];
+    for (let i = 0; i < 6; i++) { fb(BK[i], cx1 + 7 + i * 6, t1 + 5, 4, 7); fb(BK[(i + 3) % 6], cx1 + 7 + i * 6, t1 + 14, 4, 7); }
+    box2(cx1 + 4, t1 + 36, 34, 13, '#4aa3df', '#245f8c'); fb('#7cc4f0', cx1 + 6, t1 + 38, 30, 3);
+    plant(cx1 + 46, t1 + 34);
   }
 
   function chairAndDesk(i, phase) {
-    const { cx, top } = slotXY(i);
+    const p = slotXY(i);
+    if (!p) return;
+    const { cx, top } = p;
     if (phase === 'chair') {
       f(OUT, cx - 8, top + 13, 16, 15); f('#59606e', cx - 7, top + 14, 14, 13); f('#7a8294', cx - 7, top + 14, 14, 2);
       return;
@@ -410,9 +504,19 @@
     const cssS = S / dpr, fp = Math.round(Math.max(10, Math.min(14, cssS * 3.8)) * dpr);
     const X = (wx) => offX + wx * S, Y = (wy) => offY + wy * S;
     g.textAlign = 'center'; g.textBaseline = 'middle';
+    for (const r of L.rooms) { // room name on its header band
+      g.font = `700 ${fp}px Inter, "Segoe UI", sans-serif`;
+      let label = r.name;
+      const maxW = r.w * S - 8 * dpr;
+      while (label.length > 3 && g.measureText(label).width > maxW) label = label.slice(0, -2) + '…';
+      g.fillStyle = '#3a2f26';
+      g.fillText(label, X(r.x + r.w / 2), Y(r.y + 9) + dpr * 0.5);
+    }
     const n = agents.length + 1;
     for (let i = 0; i < n; i++) {
-      const { cx, top } = slotXY(i);
+      const p = slotXY(i);
+      if (!p) continue;
+      const { cx, top } = p;
       const a = i === 0 ? null : agents[i - 1];
       g.font = `600 ${fp}px Inter, "Segoe UI", sans-serif`;
       const label = (a && a.isGod ? '★ ' : '') + (a ? a.name : 'You');
@@ -512,28 +616,28 @@
   function relayout() {
     if (!box) return;
     dpr = window.devicePixelRatio || 1;
-    const r = box.getBoundingClientRect();
-    if (r.width >= 50 && r.height >= 50) { cssW = Math.floor(r.width); cssH = Math.floor(r.height); }
-    const cw = (cssW || 800) * dpr, ch = (cssH || 600) * dpr, n = agents.length + 1;
-    const colsAt = (s) => Math.max(3, Math.min(8, Math.floor((cw / s - 8 - 6 - BREAK_W) / CELL_W)));
-    let pick = null;
-    for (let s = Math.max(2, Math.floor(Math.min(cw / (8 + 3 * CELL_W + 6 + BREAK_W), ch / MIN_H))); s >= 2 && !pick; s--) {
-      const cols = colsAt(s), h = Math.max(MIN_H, TOP + Math.ceil(n / cols) * CELL_H + 10);
-      if (h * s <= ch) pick = { s, cols };
+    const sw = scroller.clientWidth, sh = scroller.clientHeight; // visible area; the canvas may be taller and scroll
+    if (sw >= 50 && sh >= 50) { cssW = sw; cssH = sh; }
+    const cw = (cssW || 800) * dpr, ch = (cssH || 600) * dpr;
+    const rooms = planRooms(agents);
+    let chosen = 2; // biggest integer scale at which every room fits; 2 is the floor
+    for (let s = Math.max(2, Math.floor(Math.min(cw / 262, ch / MIN_H))); s >= 2; s--) {
+      const l = layout(rooms, Math.floor(cw / s));
+      if (l.ok && l.H * s <= ch) { chosen = s; break; }
     }
-    if (!pick) pick = { s: 2, cols: colsAt(2) };
-    S = pick.s;
-    const needRows = Math.ceil(n / pick.cols);
-    if (!graph || pick.cols !== COLS || needRows !== rows) {
-      COLS = pick.cols;
-      buildGraph(n);
+    S = chosen;
+    const next = layout(rooms, Math.floor(cw / S));
+    const sig = `${S}|${next.ww}|${rooms.map((x) => `${x.key}:${x.name}:${x.slots}:${x.x},${x.y},${x.w},${x.h}`).join(';')}`;
+    if (!graph || sig !== L.sig) {
+      L = { ...next, sig };
+      buildGraph();
       for (const c of chars.values()) { // positions belong to the old layout
         const key = c.moving ? c.target : c.node;
         place(c, graph.nodes[key] ? key : `s${c.slot}`);
       }
     }
-    const pw = Math.round((cssW || 800) * dpr), ph = Math.round((cssH || 600) * dpr);
-    if (cv.width !== pw || cv.height !== ph) { cv.width = pw; cv.height = ph; cv.style.width = `${cssW || 800}px`; cv.style.height = `${cssH || 600}px`; }
+    const pw = Math.round((cssW || 800) * dpr), ph = Math.max(Math.round((cssH || 600) * dpr), Math.ceil(H * S)); // taller than the view = scrolls
+    if (cv.width !== pw || cv.height !== ph) { cv.width = pw; cv.height = ph; cv.style.width = `${cssW || 800}px`; cv.style.height = `${ph / dpr}px`; }
     offX = Math.max(0, Math.floor((cv.width - W * S) / 2)); offY = Math.max(0, Math.floor((cv.height - H * S) / 2));
   }
 
@@ -551,8 +655,8 @@
     }
     const n = agents.length + 1;
     for (let i = 0; i < n; i++) {
-      const { cx, top } = slotXY(i);
-      if (Math.abs(wx - cx) <= 22 && wy >= top + 12 && wy <= top + 44) return i === 0 ? 'human' : agents[i - 1].id;
+      const p = slotXY(i);
+      if (p && Math.abs(wx - p.cx) <= 22 && wy >= p.top + 12 && wy <= p.top + 44) return i === 0 ? 'human' : agents[i - 1].id;
     }
     return null;
   }
@@ -573,8 +677,8 @@
 
   function init(el, h) {
     box = el; handlers = h || {};
-    box.innerHTML = '<canvas></canvas><div class="office-tip hidden"></div><div class="office-asks"></div>';
-    cv = box.querySelector('canvas'); tip = box.querySelector('.office-tip'); asksEl = box.querySelector('.office-asks');
+    box.innerHTML = '<div class="office-scroll"><canvas></canvas></div><div class="office-tip hidden"></div><div class="office-asks"></div>';
+    scroller = box.querySelector('.office-scroll'); cv = box.querySelector('canvas'); tip = box.querySelector('.office-tip'); asksEl = box.querySelector('.office-asks');
     g = cv.getContext('2d');
     new ResizeObserver(resize).observe(box);
     cv.addEventListener('mousemove', (ev) => { const id = pick(ev); cv.style.cursor = id ? 'pointer' : 'default'; showTip(ev, id); });

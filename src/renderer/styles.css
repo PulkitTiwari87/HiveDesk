@@ -110,7 +110,8 @@ input:focus, select:focus, textarea:focus { border-color: #d9a21c; box-shadow: 0
    white cards with soft layered shadows. */
 .floor { position: relative; flex: 1; min-height: 0; overflow: hidden; background: #f5eedd; border: 2px solid #1d1d1f; border-radius: 18px; }
 #tab-floor { padding: 12px 16px 16px; overflow: hidden; }
-.floor canvas { position: absolute; left: 0; top: 0; image-rendering: pixelated; }
+.office-scroll { position: absolute; inset: 0; overflow-y: auto; overflow-x: hidden; scrollbar-gutter: stable; border-radius: 16px; }
+.floor canvas { display: block; image-rendering: pixelated; }
 .office-tip { position: absolute; z-index: 5; pointer-events: none; min-width: 190px; max-width: 280px; padding: 10px 12px; border-radius: 14px; background: rgba(255, 255, 255, 0.96); color: #1d1d1f; box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.06), 0 8px 24px rgba(40, 30, 10, 0.16), 0 2px 6px rgba(40, 30, 10, 0.08); backdrop-filter: blur(16px) saturate(180%); font-size: 12px; line-height: 17px; letter-spacing: 0; animation: tip-in 140ms ease-out; transform-origin: top left; }
 .office-tip b { font-size: 15px; letter-spacing: -0.01em; }
 .office-tip .star { color: #f2a900; }
