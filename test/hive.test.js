@@ -290,6 +290,7 @@ test('presets: every crew preset is complete, uses GStack + ECC, and the chain r
   for (const [id, p] of Object.entries(PRESETS)) {
     assert.equal(p.id, id);
     for (const k of ['name', 'role', 'instructions']) assert.ok(p[k], `${id}.${k}`);
+    if (p.secret) continue; // the secret office is a short, local-model prompt on purpose
     assert.ok(p.lead, `${id} is a lead`);
     assert.match(p.instructions, /GStack/);
     assert.match(p.instructions, /ecc:/);
@@ -352,6 +353,148 @@ test('a hired preset keeps its preset id and manager', () => {
   assert.equal(hive.manager(fe.id).id, arch.id);
   assert.match(hive.prompt(fe), /STANDING INSTRUCTIONS/);
   assert.match(hive.prompt(fe), /you report to tech-lead \(Tech Lead\)/);
+});
+
+test('human as manager: reportsTo "human" is kept, prompts say so, reports move to the human on archive', () => {
+  const hive = freshHive();
+  hive.addAgent({ id: 'orion', name: 'Orion', isGod: true });
+  const direct = hive.addAgent({ name: 'Direct', reportsTo: 'human' });
+  assert.equal(direct.reportsTo, 'human');
+  assert.match(hive.prompt(direct), /report DIRECTLY to the human/);
+  assert.equal(hive.manager(direct.id), null);
+  assert.deepEqual(hive.reports('orion').map((a) => a.id), [], 'the orchestrator does not manage them');
+  assert.equal(hive.setManager(direct.id, 'orion'), null);
+  assert.equal(hive.setManager(direct.id, 'human'), null);
+  const emp = hive.addAgent({ name: 'Emp', reportsTo: direct.id });
+  hive.archiveAgent(direct.id);
+  assert.equal(hive.getAgent(emp.id).reportsTo, 'human');
+});
+
+test('secret office: hidden from the roster, unreachable by agents, every outgoing message is held for the human', () => {
+  const hive = freshHive();
+  hive.addAgent({ id: 'orion', name: 'Orion', isGod: true });
+  const fe = hive.addAgent({ name: 'Frontend' });
+  const sh = hive.addAgent({ id: 'shadow', name: 'Shadow', secret: true, reportsTo: 'human', provider: 'local' });
+  assert.equal(sh.secret, true);
+  assert.doesNotMatch(hive.prompt(fe), /shadow/i, 'agents never see the secret office');
+  assert.match(hive.prompt(sh), /SECRET OFFICE/);
+  assert.doesNotMatch(hive.prompt(sh), /CAVEMEN = minimum tokens/, 'the local model gets the one-line method');
+  // an agent cannot reach it, and broadcast skips it
+  hive.send({ to: 'shadow', subject: 'psst' }, fe.id);
+  assert.equal(hive.unread('shadow').length, 0);
+  assert.ok(!hive.resolve('broadcast', fe.id).includes('shadow'));
+  // the human can
+  hive.send({ to: 'shadow', act: 'request', subject: 'research X' }, 'human');
+  assert.equal(hive.unread('shadow').length, 1);
+  // its message to an implementer lands in the HUMAN inbox, marked secret, not in the implementer's
+  hive.send({ to: fe.id, act: 'request', subject: 'Proposal: build it', body: 'do it' }, 'shadow');
+  assert.equal(hive.unread(fe.id).length, 0);
+  const held = hive.unread('human');
+  assert.equal(held.length, 1);
+  assert.equal(held[0].secret, true);
+  assert.match(held[0].subject, /held for your approval; was to /);
+  // via an outbox file too (the real path)
+  const godBefore = hive.unread('orion').length; // the bounced "psst" from the agent is already there
+  outbox(hive, 'shadow', 'p.json', { to: 'god', act: 'propose', subject: 'Proposal: two' });
+  hive.routeOnce();
+  assert.equal(hive.unread('orion').length, godBefore, 'nothing from the secret office reached the orchestrator');
+  assert.equal(hive.unread('human').length, 2);
+  // to the human directly is untouched
+  hive.send({ to: 'human', act: 'inform', subject: 'fyi' }, 'shadow');
+  assert.equal(hive.unread('human').length, 3);
+});
+
+test('kill: removes the agent and its folder, moves reports up, refuses the orchestrator, never leaves hive/agents', () => {
+  const hive = freshHive();
+  hive.addAgent({ id: 'orion', name: 'Orion', isGod: true });
+  const lead = hive.addAgent({ name: 'Lead' });
+  const emp = hive.addAgent({ name: 'Emp', reportsTo: lead.id });
+  hive.kbWrite(lead.id, 'notes.md', 'hello');
+  assert.ok(fs.existsSync(hive.agentDir(lead.id)));
+  const keep = path.join(hive.root, 'keep.txt');
+  fs.writeFileSync(keep, 'x');
+  const r = hive.killAgent(lead.id);
+  assert.equal(r.ok, true);
+  assert.equal(r.removed, true);
+  assert.ok(!fs.existsSync(hive.agentDir(lead.id)), 'memory, knowledge, inbox and outbox are gone');
+  assert.equal(hive.getAgent(lead.id), null, 'gone from the registry, not just archived');
+  assert.equal(hive.getAgent(emp.id).reportsTo, 'orion');
+  assert.ok(fs.existsSync(hive.agentDir(emp.id)) && fs.existsSync(keep), 'nothing else is touched');
+  assert.match(hive.killAgent('orion').error, /cannot be killed/);
+  assert.equal(hive.killAgent('nobody').ok, false);
+  assert.ok(hive.readLog(20).some((e) => e.type === 'agent-killed' && e.agent === lead.id), 'the audit log keeps a record');
+  // a name that tries to escape the agents folder is refused by the guard
+  const evil = hive.addAgent({ id: 'x', name: 'X' });
+  const reg = hive.registry(); reg.agents.find((a) => a.id === 'x').id = '..'; hive.saveRegistry(reg);
+  const sibling = path.join(hive.root, 'tasks.json');
+  assert.equal(hive.killAgent('..').removed, false);
+  assert.ok(fs.existsSync(sibling) && fs.existsSync(hive.p('agents')), 'path traversal never deletes outside agents/');
+  void evil;
+});
+
+test('knowledge base: safe file names, size cap, list/read/delete, mentioned in the prompt', () => {
+  const hive = freshHive();
+  const a = hive.addAgent({ name: 'Kay' });
+  assert.ok(hive.kbList(a.id).some((f) => f.name === 'readme.md'), 'seeded with a readme');
+  assert.deepEqual(hive.kbWrite(a.id, 'Style Guide.MD', '# tabs'), { ok: true, name: 'style-guide.md' });
+  assert.equal(hive.kbRead(a.id, 'style-guide.md'), '# tabs');
+  for (const bad of ['../evil.md', '..\\evil.md', 'a.exe', '.md', '', 'x/y.md']) {
+    const r = hive.kbWrite(a.id, bad, 'x');
+    if (r.ok) assert.ok(!r.name.includes('/') && !r.name.includes('..') && /\.(md|txt)$/.test(r.name), bad); // basename-only normalization
+  }
+  assert.equal(hive.kbWrite(a.id, 'a.exe', 'x').ok, false);
+  assert.equal(hive.kbWrite(a.id, 'big.md', 'x'.repeat(200001)).ok, false);
+  assert.ok(!fs.existsSync(path.join(hive.root, 'evil.md')) && !fs.existsSync(path.join(hive.agentDir(a.id), 'evil.md')));
+  assert.equal(hive.kbDelete(a.id, 'style-guide.md'), true);
+  assert.equal(hive.kbRead(a.id, 'style-guide.md'), null);
+  assert.match(hive.prompt(a), /KNOWLEDGE BASE/);
+  assert.match(hive.prompt(a), /knowledge/);
+});
+
+test('research department and secret office presets: scraping guardrails, local model, human manager', () => {
+  const { PRESETS, RESEARCH_TEAM, mergedPresets, planTeam } = require('../src/main/presets');
+  assert.deepEqual(RESEARCH_TEAM, ['researchlead', 'scraper', 'analyst']);
+  for (const id of RESEARCH_TEAM) {
+    const t = PRESETS[id].instructions;
+    assert.match(t, /robots\.txt/);
+    assert.match(t, /Never bypass CAPTCHAs/);
+    assert.match(t, /Cite the source/);
+  }
+  assert.match(PRESETS.scraper.instructions, /scrapling-official/);
+  assert.match(PRESETS.scraper.instructions, /playwright-cli/);
+  assert.match(PRESETS.researchlead.instructions, /agent-reach/);
+  assert.equal(PRESETS.scraper.reportsTo, 'researchlead');
+  assert.equal(PRESETS.secret.provider, 'local');
+  assert.equal(PRESETS.secret.secret, true);
+  assert.equal(PRESETS.secret.reportsTo, 'human');
+  assert.match(PRESETS.secret.instructions, /nothing is dispatched until the human approves/);
+  const plan = planTeam([{ id: 'orion', isGod: true }], mergedPresets({}), ['secret', 'researchlead', 'scraper']);
+  assert.deepEqual(plan.map((h) => [h.presetId, h.reportsTo]), [['secret', 'human'], ['researchlead', 'orion'], ['scraper', 'preset:researchlead']]);
+});
+
+test('local model: claude CLI is pointed at the local server, every model tier maps to it, no effort flag, clear error when not set up', { skip: !resolveCommand('claude') && 'claude not installed' }, () => {
+  const { localEnv } = require('../src/main/agents');
+  const hive = freshHive();
+  const meta = hive.addAgent({ name: 'Loc', provider: 'local', effort: 'high' });
+  const none = new AgentManager({ hive, hookUrl: () => 'http://127.0.0.1:1/x', workspace: hive.root });
+  assert.throws(() => none.launchSpec(meta, { resume: false }), /local model is not set up/);
+  const lm = { baseUrl: 'http://127.0.0.1:11434', model: 'hivedesk-local' };
+  const m = new AgentManager({ hive, hookUrl: () => 'http://127.0.0.1:1/x', workspace: hive.root, localModel: () => lm });
+  const prev = process.env.ANTHROPIC_BASE_URL; process.env.ANTHROPIC_BASE_URL = 'https://cloud.example'; // must be overridden, not leaked
+  try {
+    const spec = m.launchSpec(meta, { resume: false });
+    for (const k of ['ANTHROPIC_MODEL', 'ANTHROPIC_DEFAULT_OPUS_MODEL', 'ANTHROPIC_DEFAULT_SONNET_MODEL', 'ANTHROPIC_DEFAULT_HAIKU_MODEL', 'CLAUDE_CODE_SUBAGENT_MODEL']) assert.equal(spec.env[k], 'hivedesk-local', k);
+    assert.equal(spec.env.ANTHROPIC_BASE_URL, 'http://127.0.0.1:11434');
+    assert.equal(spec.env.ANTHROPIC_AUTH_TOKEN, 'ollama');
+    assert.equal(spec.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, '1');
+    assert.equal(spec.args[spec.args.indexOf('--model') + 1], 'hivedesk-local');
+    assert.ok(!spec.args.includes('--effort'), 'a local model has no effort levels');
+    assert.ok(spec.args.includes('--append-system-prompt') && spec.hooks, 'same CLI, same hooks');
+    assert.equal(localEnv(lm).ANTHROPIC_BASE_URL, lm.baseUrl);
+    // a normal Claude agent is unaffected by the local model
+    const cloud = hive.addAgent({ name: 'Cloud', provider: 'claude' });
+    assert.notEqual(m.launchSpec(cloud, { resume: false }).env.ANTHROPIC_BASE_URL, 'http://127.0.0.1:11434');
+  } finally { if (prev === undefined) delete process.env.ANTHROPIC_BASE_URL; else process.env.ANTHROPIC_BASE_URL = prev; }
 });
 
 test('claude launch passes --model and --effort', () => {

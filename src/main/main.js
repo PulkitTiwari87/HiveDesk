@@ -11,7 +11,8 @@ const { execFile } = require('node:child_process');
 const { Hive, readJson, writeJson } = require('./hive');
 const { AgentManager, PROVIDERS, resolveCommand } = require('./agents');
 const { Mirror } = require('./mirror');
-const { mergedPresets, planTeam, PRODUCTION_TEAM, WORKFLOW, PLAYBOOK } = require('./presets');
+const { mergedPresets, planTeam, PRODUCTION_TEAM, RESEARCH_TEAM, WORKFLOW, PLAYBOOK } = require('./presets');
+const localmodel = require('./localmodel');
 const mirror = new Mirror();
 
 const settingsFile = () => path.join(app.getPath('userData'), 'settings.json');
@@ -25,8 +26,10 @@ const DEFAULT_SETTINGS = {
   restoreAgents: true,
   gitCommit: true,
   presetOverrides: {}, // { <presetId>: { name, role, model, effort, autonomy, instructions, reportsTo } }
+  localModel: { ...localmodel.DEFAULTS }, // optional: Claude Code against a local Ollama model
 };
 let settings = { ...DEFAULT_SETTINGS, ...readJson(settingsFile(), {}) };
+settings.localModel = { ...localmodel.DEFAULTS, ...(settings.localModel || {}) };
 if (process.env.HIVEDESK_WORKSPACE) settings.workspace = process.env.HIVEDESK_WORKSPACE; // used by tests
 
 let win = null;
@@ -113,12 +116,39 @@ function ensureGod() {
   });
 }
 
+// Local-model agents need the Ollama server up first (started on demand, only when the local model is enabled).
+async function startAgent(meta, opts) {
+  if (meta.provider === 'local' && settings.localModel.enabled) {
+    const s = await localmodel.ensureServer(settings.localModel);
+    if (!s.ok) return agents.failed(meta.id, s.error);
+  }
+  return agents.start(meta, opts);
+}
+
+// Hire the presets in `wantList` that are not hired yet (managers first); `reportsTo` falls back to the orchestrator.
+function hirePresets(wantList, dir) {
+  const g = hive.god();
+  const presets = mergedPresets(settings.presetOverrides);
+  const idOf = new Map(hive.agents().filter((a) => a.presetId).map((a) => [a.presetId, a.id]));
+  const hired = [];
+  for (const h of planTeam(hive.agents(), presets, wantList)) {
+    let mgr = h.reportsTo;
+    if (String(mgr).startsWith('preset:')) mgr = idOf.get(mgr.slice(7)) || (g && g.id); // manager not in this batch
+    const { id: _templateId, ...tpl } = presets[h.presetId]; // never reuse the template id: addAgent would overwrite an archived agent with it
+    const meta = hive.addAgent({ ...tpl, presetId: h.presetId, reportsTo: mgr, cwd: dir });
+    idOf.set(h.presetId, meta.id);
+    startAgent(meta);
+    hired.push(meta.name);
+  }
+  return { hired, idOf, presets };
+}
+
 function boot() {
   fs.mkdirSync(settings.workspace, { recursive: true });
   hive = new Hive(path.join(settings.workspace, 'hive'));
   hive.init();
   hive.onLog = (ev) => send('hive:log', ev);
-  agents = new AgentManager({ hive, hookUrl, workspace: settings.workspace });
+  agents = new AgentManager({ hive, hookUrl, workspace: settings.workspace, localModel: () => (settings.localModel.enabled ? { baseUrl: settings.localModel.baseUrl, model: settings.localModel.name } : null) });
   agents.on('data', (id, d) => send('pty:data', id, d));
   agents.on('status', (id, info) => {
     send('agent:status', id, info);
@@ -129,7 +159,7 @@ function boot() {
   gitInit().then(() => scheduleCommit('app start'));
   ensureGod();
   const toStart = settings.restoreAgents ? hive.agents() : hive.agents().filter((a) => a.isGod);
-  for (const a of toStart) agents.start(a, { resume: true });
+  for (const a of toStart) startAgent(a, { resume: true });
   timers.push(setInterval(routerTick, 1000));
   timers.push(setInterval(spawnTick, 2000));
 }
@@ -153,8 +183,11 @@ function routerTick() {
 }
 
 // Spawn requests written by god.
+const spawning = new Set(); // requests whose agent is still starting (a local model can take a while): never spawn twice
 function spawnTick() {
   for (const { file, req } of hive.takeSpawnRequests()) {
+    if (spawning.has(file)) continue;
+    spawning.add(file);
     if (!req.objective) { hive.finishSpawnRequest(file, false, 'missing "objective"'); continue; }
     const meta = hive.addAgent({
       name: req.name || `Worker ${hive.agents().length}`,
@@ -168,10 +201,12 @@ function spawnTick() {
     });
     const g = hive.god();
     hive.send({ to: meta.id, act: 'request', subject: 'Your assignment', body: String(req.objective) }, g ? g.id : 'human');
-    const r = agents.start(meta);
-    hive.finishSpawnRequest(file, r.ok, r.error);
-    send('agents:changed');
-    scheduleCommit(`spawn ${meta.id}`);
+    startAgent(meta).then((r) => {
+      spawning.delete(file);
+      hive.finishSpawnRequest(file, r.ok, r.error);
+      send('agents:changed');
+      scheduleCommit(`spawn ${meta.id}`);
+    });
   }
 }
 
@@ -209,6 +244,7 @@ function registerIpc() {
     agents: hive.agents().map(agentView),
     presets: mergedPresets(settings.presetOverrides),
     productionTeam: PRODUCTION_TEAM,
+    researchTeam: RESEARCH_TEAM,
     workflow: WORKFLOW,
     git: gitAvailable,
   }));
@@ -221,6 +257,10 @@ function registerIpc() {
       const n = String(p.name).trim().slice(0, 40);
       if (!n) return { ok: false, error: 'Name cannot be empty.' };
       patch.name = n;
+    }
+    if (p.provider !== undefined && p.provider !== a.provider) { // engine switch (e.g. Claude <-> local model): a fresh session, the old one belongs to another backend
+      if (!PROVIDERS[p.provider]) return { ok: false, error: 'Unknown engine.' };
+      Object.assign(patch, { provider: p.provider, sessionId: crypto.randomUUID(), started: false });
     }
     if (p.role !== undefined) patch.role = String(p.role).trim().slice(0, 300);
     if (p.instructions !== undefined) patch.instructions = String(p.instructions).slice(0, 20000);
@@ -238,7 +278,7 @@ function registerIpc() {
     hive.log({ type: 'agent-updated', agent: id, fields: Object.keys({ ...patch, ...(p.reportsTo !== undefined ? { reportsTo: 1 } : {}) }) });
     send('agents:changed');
     scheduleCommit(`update ${id}`);
-    const restart = !!(patch.name || patch.role || patch.instructions || patch.autonomy || p.reportsTo !== undefined);
+    const restart = !!(patch.name || patch.role || patch.instructions || patch.autonomy || patch.provider || p.reportsTo !== undefined);
     return { ok: true, applied: r.applied, needsRestart: restart && agents.info(id).status !== 'stopped' };
   });
   // Edit a preset template (kept in settings, so it survives restarts and applies to future hires).
@@ -265,20 +305,9 @@ function registerIpc() {
     if (!g) return { ok: false, error: 'No orchestrator. Enable it in Settings first.' };
     if (!String(brief || '').trim()) return { ok: false, error: 'Describe what to build first.' };
     const presets = mergedPresets(settings.presetOverrides);
-    const wantList = (Array.isArray(wanted) && wanted.length ? wanted : PRODUCTION_TEAM).filter((x) => presets[x]);
+    const wantList = (Array.isArray(wanted) && wanted.length ? wanted : PRODUCTION_TEAM).filter((x) => presets[x] && !presets[x].secret);
     const dir = cwd || settings.workspace;
-    const idOf = new Map(hive.agents().filter((a) => a.presetId).map((a) => [a.presetId, a.id]));
-    const hired = [];
-    for (const h of planTeam(hive.agents(), presets, wantList)) {
-      const p = presets[h.presetId];
-      let mgr = h.reportsTo;
-      if (String(mgr).startsWith('preset:')) mgr = idOf.get(mgr.slice(7)) || g.id; // manager not in this batch: report to the orchestrator
-      const { id: _templateId, ...tpl } = p; // never reuse the template id: addAgent would overwrite an archived agent with it
-      const meta = hive.addAgent({ ...tpl, presetId: h.presetId, reportsTo: mgr, cwd: dir });
-      idOf.set(h.presetId, meta.id);
-      agents.start(meta);
-      hired.push(meta.name);
-    }
+    const { hired, idOf } = hirePresets(wantList, dir);
     for (const a of hive.agents()) if (a.presetId && wantList.includes(a.presetId) && a.cwd !== dir && !hired.includes(a.name)) hive.updateAgent(a.id, { cwd: dir });
     const roster = wantList.map((pid) => idOf.get(pid)).filter(Boolean).map((id) => hive.getAgent(id)).map((a) => `- ${a.id} (${a.name}): ${a.role}; reports to ${(hive.manager(a.id) || {}).id || 'you'}`).join('\n');
     const body = `${String(brief).trim()}\n\nProject folder: ${dir}\n\nYour team (employees, already hired and running):\n${roster}\n\n${PLAYBOOK}`;
@@ -297,22 +326,87 @@ function registerIpc() {
   ipcMain.handle('mirror:list', () => mirror.list(new Set(hive.agents({ includeArchived: true }).map((a) => a.sessionId))));
   ipcMain.handle('mirror:read', (_e, id, limit) => mirror.read(id, Math.min(Number(limit) || 200, 500)));
   ipcMain.handle('agents:list', () => hive.agents().map(agentView));
-  ipcMain.handle('agent:create', (_e, input) => {
+  ipcMain.handle('agent:create', async (_e, input) => {
     const meta = hive.addAgent({ ...input, isGod: false });
-    const r = agents.start(meta);
+    const r = await startAgent(meta);
     if (input.objective) hive.send({ to: meta.id, act: 'request', subject: 'Your first task', body: input.objective }, 'human');
     scheduleCommit(`hire ${meta.id}`);
     return { ...r, agent: agentView(meta) };
   });
   ipcMain.handle('agent:start', (_e, id) => {
     const a = hive.getAgent(id);
-    return a ? agents.start(a, { resume: true }) : { ok: false, error: 'unknown agent' };
+    return a ? startAgent(a, { resume: true }) : { ok: false, error: 'unknown agent' };
   });
   ipcMain.handle('agent:fresh', (_e, id) => {
     if (!hive.getAgent(id)) return { ok: false, error: 'unknown agent' };
     agents.stop(id);
     const meta = hive.updateAgent(id, { sessionId: crypto.randomUUID(), started: false });
-    return agents.start(meta);
+    return startAgent(meta);
+  });
+  // KILL: permanently delete an agent: its hive folder (memory, knowledge, inbox, outbox) and its Claude Code transcript. The audit log keeps a record.
+  ipcMain.handle('agent:kill', async (_e, id) => {
+    const a = hive.getAgent(id);
+    if (!a) return { ok: false, error: 'unknown agent' };
+    if (a.isGod) return { ok: false, error: 'The orchestrator cannot be killed. Archive it or turn it off in Settings.' };
+    agents.forget(id);
+    await new Promise((r) => setTimeout(r, 800)); // let the process release its files (Windows)
+    const r = hive.killAgent(id);
+    if (!r.ok) return r;
+    const transcript = mirror.deleteSession(r.sessionId);
+    send('agents:changed');
+    scheduleCommit(`kill ${id}`);
+    return { ...r, transcript };
+  });
+  // Team: hire any set of presets (research department, secret office) without sending a brief.
+  ipcMain.handle('team:hire', (_e, { wanted, cwd } = {}) => {
+    const presets = mergedPresets(settings.presetOverrides);
+    const list = (Array.isArray(wanted) ? wanted : []).filter((x) => presets[x]);
+    if (!list.length) return { ok: false, error: 'Nothing to hire.' };
+    const { hired } = hirePresets(list, cwd || settings.workspace);
+    send('agents:changed');
+    scheduleCommit('hire team');
+    return { ok: true, hired };
+  });
+  // Knowledge base: notes the human curates per agent (hive/agents/<id>/knowledge).
+  ipcMain.handle('kb:list', (_e, id) => (hive.getAgent(id) ? hive.kbList(id) : []));
+  ipcMain.handle('kb:read', (_e, id, name) => (hive.getAgent(id) ? hive.kbRead(id, name) : null));
+  ipcMain.handle('kb:write', (_e, id, name, text) => { const r = hive.kbWrite(id, name, text); if (r.ok) scheduleCommit(`knowledge ${id}`); return r; });
+  ipcMain.handle('kb:delete', (_e, id, name) => hive.kbDelete(id, name));
+  ipcMain.handle('kb:open', (_e, id) => (hive.getAgent(id) ? shell.openPath(hive.kbDir(id)) : ''));
+  // Optional local model (Ollama). Nothing starts until it is enabled and an agent uses it.
+  ipcMain.handle('local:status', async () => ({ cfg: settings.localModel, ...(await localmodel.status(settings.localModel)) }));
+  ipcMain.handle('local:save', (_e, n = {}) => {
+    const cur = settings.localModel;
+    let baseUrl = cur.baseUrl;
+    try { const u = new URL(String(n.baseUrl || cur.baseUrl)); if (['127.0.0.1', 'localhost', '[::1]'].includes(u.hostname) && /^https?:$/.test(u.protocol)) baseUrl = u.origin; } catch { /* keep the old one */ }
+    const ctx = Math.max(4096, Math.min(131072, Math.round(Number(n.ctx) || cur.ctx)));
+    const name = /^[a-z0-9][a-z0-9._-]{0,39}$/i.test(String(n.name || '')) ? String(n.name) : cur.name;
+    settings.localModel = { enabled: !!n.enabled, gguf: String(n.gguf || cur.gguf), name, baseUrl, ctx };
+    writeJson(settingsFile(), settings);
+    return { ok: true, cfg: settings.localModel };
+  });
+  ipcMain.handle('local:setup', async () => {
+    const r = await localmodel.setup(settings.localModel, app.getPath('userData'), (line) => send('local:log', line));
+    return r;
+  });
+  ipcMain.handle('local:check', () => localmodel.toolCheck(settings.localModel));
+  // Secret office: the human approves (and picks who implements) or rejects a held proposal.
+  ipcMain.handle('secret:decide', (_e, { file, decision, to, note } = {}) => {
+    const msg = hive.unread('human').find((m) => m._file === file);
+    if (!msg || !msg.secret) return { ok: false, error: 'That proposal is no longer pending.' };
+    let target = null;
+    if (decision === 'approve') {
+      target = hive.getAgent(to || (hive.god() || {}).id);
+      if (!target || target.archived || target.secret) return { ok: false, error: 'Pick a live agent to carry it out.' };
+      const body = `${msg.body}\n\n---\nApproved by the human${note ? `: ${note}` : ''}. This came from the secret office (${msg.from}). Carry it out and report to your manager.`;
+      hive.send({ to: target.id, act: 'request', subject: String(msg.subject).replace(/^\[secret office[^\]]*\]\s*/, ''), body }, 'human');
+      agents.maybeWake(target.id);
+    }
+    hive.send({ to: msg.from, act: 'inform', subject: decision === 'approve' ? `Approved and dispatched to ${target.name}` : 'Rejected by the human', body: note || '', in_reply_to: msg.id, conversation: msg.conversation }, 'human');
+    agents.maybeWake(msg.from);
+    hive.markDone('human', file);
+    scheduleCommit('secret office decision');
+    return { ok: true };
   });
   ipcMain.handle('agent:stop', (_e, id) => { agents.stop(id); return { ok: true }; });
   ipcMain.handle('agent:remove', (_e, id) => {

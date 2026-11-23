@@ -24,6 +24,7 @@ const MODEL_RE = /^[\w.\-:\/\[\]]{1,80}$/; // alias or full model id; no spaces 
 
 const PROVIDERS = {
   claude: { label: 'Claude Code', bin: 'claude', hooks: true },
+  local: { label: 'Claude Code (local model)', bin: 'claude', hooks: true }, // the same CLI, pointed at the local Ollama server
   codex: { label: 'OpenAI Codex', bin: 'codex' },
   gemini: { label: 'Gemini CLI', bin: 'gemini' },
   copilot: { label: 'GitHub Copilot CLI', bin: 'copilot' },
@@ -67,9 +68,20 @@ function unwrap(full) {
 
 function oneLine(s) { return String(s).replace(/\s*\n\s*/g, ' ').trim(); }
 
+/** Environment that points Claude Code at a local Anthropic-compatible server (Ollama). Every model tier maps to the local model so no call goes to the cloud. */
+function localEnv(lm) {
+  return {
+    ANTHROPIC_BASE_URL: lm.baseUrl, ANTHROPIC_AUTH_TOKEN: 'ollama', ANTHROPIC_API_KEY: '',
+    ANTHROPIC_MODEL: lm.model, ANTHROPIC_DEFAULT_OPUS_MODEL: lm.model, ANTHROPIC_DEFAULT_SONNET_MODEL: lm.model, ANTHROPIC_DEFAULT_HAIKU_MODEL: lm.model,
+    ANTHROPIC_SMALL_FAST_MODEL: lm.model, CLAUDE_CODE_SUBAGENT_MODEL: lm.model,
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1', DISABLE_AUTOUPDATER: '1',
+  };
+}
+
 class AgentManager extends EventEmitter {
-  constructor({ hive, hookUrl, workspace }) {
+  constructor({ hive, hookUrl, workspace, localModel }) {
     super();
+    this.localModel = localModel || (() => null); // () => { baseUrl, model } once the local model is set up
     this.hive = hive;
     this.hookUrl = hookUrl; // (agentId) => URL
     this.workspace = workspace;
@@ -162,6 +174,12 @@ class AgentManager extends EventEmitter {
     }
     if (insideClaude) delete env.ANTHROPIC_BASE_URL;
     Object.assign(env, { AGENT_ID: meta.id, AGENT_NAME: meta.name, HIVE_ROOT: this.hive.root, AGENT_DIR: dir });
+    let lm = null;
+    if (meta.provider === 'local') { // after the cleanup above, so the local endpoint is not stripped
+      lm = this.localModel();
+      if (!lm) throw new Error('The local model is not set up yet. Open Settings > Local model and set it up first.');
+      Object.assign(env, localEnv(lm));
+    }
     const resuming = !!(resume && meta.started);
     const args = [];
     let typedPrompt = null;
@@ -181,14 +199,14 @@ class AgentManager extends EventEmitter {
       if (!resolved) throw new Error(`"${meta.command || prov.bin}" was not found on PATH. Install ${prov.label} first or pick another engine.`);
     }
 
-    if (meta.provider === 'claude') {
+    if (meta.provider === 'claude' || meta.provider === 'local') {
       args.push('--append-system-prompt', this.hive.prompt(meta));
       args.push('--add-dir', this.hive.root);
       args.push('--settings', this.writeClaudeSettings(meta));
       if (resuming) args.push('--resume', meta.sessionId);
       else args.push('--session-id', meta.sessionId);
-      if (meta.model) args.push('--model', meta.model);
-      if (EFFORTS.includes(meta.effort)) args.push('--effort', meta.effort);
+      if (meta.model || lm) args.push('--model', meta.model || lm.model);
+      if (meta.provider === 'claude' && EFFORTS.includes(meta.effort)) args.push('--effort', meta.effort); // a local model has no effort levels
       if (meta.autonomy === 'edits') args.push('--permission-mode', 'acceptEdits');
       if (meta.autonomy === 'full') args.push('--dangerously-skip-permissions');
     } else if (meta.provider === 'codex') {
@@ -413,4 +431,4 @@ class AgentManager extends EventEmitter {
   }
 }
 
-module.exports = { AgentManager, PROVIDERS, EFFORTS, resolveCommand };
+module.exports = { AgentManager, PROVIDERS, EFFORTS, resolveCommand, localEnv };

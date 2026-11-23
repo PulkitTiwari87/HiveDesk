@@ -155,6 +155,18 @@ The **Team** tab is the management view.
 
 Status: Implemented. Skill names that are not installed on your machine are skipped by the agents.
 
+### Rooms on the floor
+The pixel office is rooms joined by hallways: **Your office** (desk, bookshelf, sofa), the orchestrator's office, one room per team (Product & Design, Engineering, Security, Deployment, Research Dept, General) and the locked **Secret office**. A room is a lead plus everyone under them, so the layout follows the real reporting lines. Waiting agents walk into your office to ask you.
+
+### Kill, knowledge base, research department, secret office
+- **Kill** (Terminal header and org chart; never the orchestrator) permanently deletes an agent: its hive folder (memory, knowledge, inbox, outbox) and its own Claude Code transcript, after a confirmation. The activity log and the hive's git history keep a trace. **Archive** stays the non-destructive option.
+- **Knowledge tab:** per-agent notes (`hive/agents/<id>/knowledge/*.md|txt`) you write and edit. Every agent's prompt points at its folder.
+- **Research department** (Team tab > Hire research dept): Research Lead, Web Scraper, Research Analyst, using `agent-reach`, `scrapling-official`, `playwright-cli` and the ECC research skills. Web rules are built in: public pages only, robots.txt and rate limits respected, no CAPTCHA/login/bot-detection bypass, no bulk personal data, sources cited.
+- **Secret office** (Secret office tab): a private analyst on your local model that reports only to you. Other agents cannot see or message it, and **every message it sends to an agent is held in your inbox**: nothing is implemented until you click **Approve & dispatch** (choose who carries it out) or **Reject**. You can also assign tasks directly to any agent, and set any agent's manager to **You** so you manage it yourself.
+
+### Optional local model (Ollama)
+Settings > Local model. Off by default. When enabled, the engine **Claude Code (local model)** runs the normal `claude` CLI against your local Ollama server, with every model tier mapped to the local model. **Set up** imports your `.gguf` into Ollama under its own name with a Claude-Code-sized context (it does not touch your own Modelfile; a Modelfile with `num_ctx 1024` cannot work with Claude Code). **Test tool calling** sends one real tool request, because Claude Code needs tool support. Hivedesk starts `ollama serve` itself when a local agent starts, with flash attention and a q8 KV cache. Expect slow answers from a 27B model on an 8 GB GPU.
+
 ## Autonomy levels
 
 | Setting | Claude Code | Codex |

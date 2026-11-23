@@ -12,6 +12,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 
 const HOP_CAP = 8;
+const KB_MAX = 200000; // characters per knowledge note
 const ACTS = ['request', 'inform', 'propose', 'query', 'agree', 'refuse', 'done'];
 const REPLY_ACTS = ['request', 'query', 'propose'];
 
@@ -139,6 +140,7 @@ class Hive {
       isGod: !!input.isGod,
       presetId: input.presetId || '',
       lead: !!input.lead,
+      secret: !!input.secret, // works for the human only: hidden from the roster, its messages are held for approval
       reportsTo: input.isGod ? null : this.validManager(input.id || '', input.reportsTo, reg),
       sessionId: input.sessionId || crypto.randomUUID(),
       started: false,
@@ -179,6 +181,7 @@ class Hive {
   // ---------- hierarchy: orchestrator > managers > employees ----------
   /** Live manager id for `reportsTo`, or the orchestrator when it is missing, archived or would make a cycle. */
   validManager(id, reportsTo, reg = this.registry()) {
+    if (reportsTo === 'human') return 'human'; // managed directly by the user, no orchestrator in between
     const live = reg.agents.filter((a) => !a.archived);
     const g = live.find((a) => a.isGod);
     const fallback = g && g.id !== id ? g.id : null;
@@ -203,11 +206,57 @@ class Hive {
   }
 
   manager(id) { const a = this.getAgent(id); return a && !a.isGod ? this.getAgent(this.validManager(id, a.reportsTo)) : null; }
-  reports(id) { return this.agents().filter((a) => !a.isGod && this.validManager(a.id, a.reportsTo) === id); }
+  reports(id) { return this.agents().filter((a) => !a.isGod && !a.secret && this.validManager(a.id, a.reportsTo) === id); }
+
+  /** Permanently remove an agent: its registry entry and hive folder. Its reports move up. The audit log keeps a record. */
+  killAgent(id) {
+    const reg = this.registry();
+    const a = reg.agents.find((x) => x.id === id);
+    if (!a) return { ok: false, error: 'unknown agent' };
+    if (a.isGod) return { ok: false, error: 'The orchestrator cannot be killed. Archive it or turn it off in Settings.' };
+    const up = this.validManager(id, a.reportsTo, reg);
+    reg.agents = reg.agents.filter((x) => x.id !== id);
+    reg.agents.forEach((x) => { if (x.reportsTo === id) x.reportsTo = up; });
+    this.saveRegistry(reg);
+    const dir = path.resolve(this.agentDir(id)), base = path.resolve(this.p('agents'));
+    let removed = false;
+    if (dir.startsWith(base + path.sep)) { // never delete anything outside hive/agents
+      try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); removed = true; } catch { /* a locked file: report it */ }
+    }
+    this.log({ type: 'agent-killed', agent: id, name: a.name });
+    return { ok: true, name: a.name, sessionId: a.sessionId, removed };
+  }
+
+  // ---------- knowledge base: notes the human curates for each agent ----------
+  kbDir(id) { return path.join(this.agentDir(id), 'knowledge'); }
+  /** Basename only, .md or .txt, safe characters. Returns null for anything else. */
+  kbName(name) {
+    const n = path.basename(String(name || '')).trim().toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^[.-]+/, '');
+    return /^[a-z0-9][a-z0-9._-]{0,60}\.(md|txt)$/.test(n) ? n : null;
+  }
+  kbList(id) {
+    try {
+      return fs.readdirSync(this.kbDir(id)).filter((f) => this.kbName(f) === f).sort()
+        .map((f) => ({ name: f, size: fs.statSync(path.join(this.kbDir(id), f)).size }));
+    } catch { return []; }
+  }
+  kbRead(id, name) { const n = this.kbName(name); try { return n ? fs.readFileSync(path.join(this.kbDir(id), n), 'utf8') : null; } catch { return null; } }
+  kbWrite(id, name, text) {
+    const n = this.kbName(name);
+    if (!n) return { ok: false, error: 'Use a simple file name ending in .md or .txt.' };
+    if (!this.getAgent(id)) return { ok: false, error: 'unknown agent' };
+    if (String(text).length > KB_MAX) return { ok: false, error: `Each note is limited to ${KB_MAX / 1000} KB.` };
+    fs.mkdirSync(this.kbDir(id), { recursive: true });
+    atomicWrite(path.join(this.kbDir(id), n), String(text));
+    return { ok: true, name: n };
+  }
+  kbDelete(id, name) { const n = this.kbName(name); try { if (n) fs.unlinkSync(path.join(this.kbDir(id), n)); return !!n; } catch { return false; } }
 
   ensureAgentFiles(meta) {
     const dir = this.agentDir(meta.id);
-    for (const d of ['inbox/.done', 'outbox']) fs.mkdirSync(path.join(dir, d), { recursive: true });
+    for (const d of ['inbox/.done', 'outbox', 'knowledge']) fs.mkdirSync(path.join(dir, d), { recursive: true });
+    const kb = path.join(dir, 'knowledge', 'readme.md');
+    if (!fs.existsSync(kb) && !this.kbList(meta.id).length) fs.writeFileSync(kb, `# Knowledge base: ${meta.name}\n\nNotes the human curated for this agent. Add .md or .txt files here (or from the Knowledge tab).\n`, 'utf8');
     fs.writeFileSync(path.join(dir, 'identity.md'),
       `# ${meta.name} (${meta.id})\n\n- Role: ${meta.role}\n- Engine: ${meta.provider}\n- Orchestrator: ${meta.isGod ? 'yes (god)' : 'no'}\n`, 'utf8');
     const mem = path.join(dir, 'memory.md');
@@ -217,7 +266,7 @@ class Hive {
   // ---------- prompt injected into every agent ----------
   prompt(meta) {
     const dir = this.agentDir(meta.id);
-    const roster = this.agents().map((a) => `${a.id} (${a.name}: ${a.role}${a.isGod ? ', orchestrator' : ''})`).join('; ');
+    const roster = this.agents().filter((a) => !a.secret || meta.secret).map((a) => `${a.id} (${a.name}: ${a.role}${a.isGod ? ', orchestrator' : ''})`).join('; ');
     const lines = [
       `You are "${meta.name}" (agent id: ${meta.id}), an autonomous agent in a collaborating hive of AI agents. Your role: ${meta.role}.`,
       `Your private hive folder is ${dir}. The shared hive is ${this.root}. Full protocol: ${this.p('PROTOCOL.md')}.`,
@@ -226,6 +275,7 @@ class Hive {
       `2. To ask another agent for something or report back, write ONE message JSON into ${path.join(dir, 'outbox')} (schema in PROTOCOL.md). NEVER write into another agent's folder.`,
       '3. When you finish work that someone requested, send them an "act":"done" message with the result.',
       '4. Append durable facts and what you learned to memory.md.',
+      `5. KNOWLEDGE BASE: ${path.join(dir, 'knowledge')} holds notes the human curated for you. List it at the start of a task and read only what is relevant.`,
       `Current roster: ${roster || 'just you'}. The live roster is always in ${this.p('registry.json')}.`,
     ];
     if (meta.isGod) {
@@ -243,17 +293,20 @@ class Hive {
     } else {
       const boss = this.manager(meta.id);
       const staff = this.reports(meta.id);
-      lines.push(
-        `CHAIN OF COMMAND: you report to ${boss ? `${boss.id} (${boss.name})` : 'the orchestrator'}. Send status updates and your "done" message there. Peers may message you directly for collaboration; escalate ambiguous, cross-cutting or sign-off questions to your manager, and to "god" (the orchestrator) when your manager cannot decide.`,
-      );
+      const direct = this.validManager(meta.id, meta.reportsTo) === 'human';
+      lines.push(direct
+        ? 'CHAIN OF COMMAND: you report DIRECTLY to the human (the user), not to the orchestrator. Send status updates, questions and your "done" message with "to":"human". The human assigns your tasks and manages you personally.'
+        : `CHAIN OF COMMAND: you report to ${boss ? `${boss.id} (${boss.name})` : 'the orchestrator'}. Send status updates and your "done" message there. Peers may message you directly for collaboration; escalate ambiguous, cross-cutting or sign-off questions to your manager, and to "god" (the orchestrator) when your manager cannot decide.`);
+      if (meta.secret) lines.push('SECRET OFFICE: you work privately for the human. Other agents cannot see you, and anything you send to another agent is delivered to the human instead. Research and plan; write findings and proposals to the human as act:"propose" (subject starting "Proposal:"), listing the exact tasks and which role should do each. Only the human can approve work: implementers start only after the human confirms.');
       if (staff.length) lines.push(`Your direct reports: ${staff.map((a) => `${a.id} (${a.name})`).join(', ')}. Delegate to them by message and consolidate their reports for your manager.`);
       if (meta.lead) lines.push('You are a LEAD for your function. If your lane is overloaded, ask "god" for a worker: write a spawn request (see PROTOCOL.md) with "reportsTo": "' + meta.id + '".');
     }
-    lines.push(
+    // The secret office runs on a small local model with a small context: it gets the one-line version.
+    lines.push(...(meta.secret ? ['CODING METHOD: CAVEMEN (minimum tokens, terse reports) + PONYTAIL (YAGNI, smallest correct change).'] : [
       'CODING METHOD (every agent that writes code follows it; the orchestrator puts it in every code dispatch): CAVEMEN + PONYTAIL. Load the "caveman" and "ponytail" skills with the Skill tool if installed.',
       'CAVEMEN = minimum tokens for a correct result: TARGET > INSPECT > IMPLEMENT > TEST > VERIFY. Read only the files the task needs, use targeted searches, do not re-read unchanged files, do not scan the whole repo, plan in a few lines, then implement directly. Keep messages and reports terse: result, files changed, tests run, open risks.',
-      'PONYTAIL (full) = smallest correct change: YAGNI (only what the task needs), reuse existing code first, standard library first, a new dependency only with a concrete reason, smallest working diff, fix root causes not symptoms, explicit readable code, no premature optimization or generalization, no unrelated refactors or formatting churn. Test behavior, run the smallest relevant test first, then broader ones.'
-    );
+      'PONYTAIL (full) = smallest correct change: YAGNI (only what the task needs), reuse existing code first, standard library first, a new dependency only with a concrete reason, smallest working diff, fix root causes not symptoms, explicit readable code, no premature optimization or generalization, no unrelated refactors or formatting churn. Test behavior, run the smallest relevant test first, then broader ones.',
+    ]));
     if (meta.instructions) lines.push('STANDING INSTRUCTIONS FOR YOUR ROLE:', meta.instructions);
     lines.push('Env vars available: AGENT_ID, AGENT_NAME, HIVE_ROOT, AGENT_DIR.');
     return lines.join('\n');
@@ -285,13 +338,13 @@ class Hive {
     const key = String(to).trim().toLowerCase();
     const live = this.agents();
     if (key === 'human' || key === 'user') return ['human'];
-    if (key === 'broadcast' || key === 'all') return live.filter((a) => a.id !== from).map((a) => a.id);
+    if (key === 'broadcast' || key === 'all') return live.filter((a) => a.id !== from && !a.secret).map((a) => a.id);
     if (key === 'god' || key === 'orchestrator') {
       const g = live.find((a) => a.isGod);
       return g ? [g.id] : ['human'];
     }
     const hit = live.find((a) => a.id === key) || live.find((a) => a.name.toLowerCase() === key);
-    return hit ? [hit.id] : [];
+    return hit && (!hit.secret || from === 'human') ? [hit.id] : []; // only the human can reach the secret office
   }
 
   inboxDir(id) { return id === 'human' ? this.p('human', 'inbox') : path.join(this.agentDir(id), 'inbox'); }
@@ -307,6 +360,16 @@ class Hive {
   send(partial, from) {
     const msg = this.normalize(partial, from);
     let targets = this.resolve(msg.to, from);
+    const sender = from === 'human' ? null : this.getAgent(from);
+    if (sender && sender.secret) { // the approval gate: nothing from the secret office reaches an agent until the human sends it on
+      msg.secret = true;
+      const held = targets.filter((t) => t !== 'human');
+      if (held.length || !targets.length) {
+        msg.subject = `[secret office, held for your approval${held.length ? `; was to ${held.join(', ')}` : ''}] ${msg.subject}`;
+        msg.needs_human = true;
+        targets = ['human'];
+      }
+    }
     let escalated = false;
     if (msg.hops > HOP_CAP) { targets = ['human']; escalated = true; msg.needs_human = true; }
     if (!targets.length) {

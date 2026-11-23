@@ -9,6 +9,9 @@ const METHOD = [
   'RULES: you are an employee of this hive. Work your own lane, hand off by message (OBJECTIVE, OUTPUT, BOUNDARIES), keep your manager informed with short status updates, and finish with an act:"done" message that links the artifacts. Never ship, deploy, push, spend money or delete data without the human\'s approval (message "to":"human").',
 ].join('\n');
 
+// Scraping guardrails shared by everyone who touches the web.
+const RESEARCH_RULES = 'WEB RULES: public pages only. Respect robots.txt, site terms and rate limits (identify yourself, back off on 429/5xx). Never bypass CAPTCHAs, paywalls, logins or bot detection, and never use accounts or credentials the human did not give you for this task. Do not collect bulk personal data; keep only what the question needs. Cite the source URL and date for every claim.';
+
 const lead = (p) => ({
   provider: 'claude', model: '', effort: 'high', autonomy: 'edits', lead: true,
   ...p,
@@ -107,7 +110,49 @@ const PRESETS = {
       'WORK: write README (what, quickstart, config), API docs from the real contracts, and CHANGELOG. Run GStack /document-release after a release; use ecc:update-docs and ecc:documentation-lookup. Verify every command you document by running it.',
     ],
   }),
+  // ---- Research department (optional): web-wide research with scraping skills ----
+  researchlead: lead({
+    id: 'researchlead', name: 'Research Lead', reportsTo: 'god',
+    role: 'Runs the research department: scopes questions, assigns collection and analysis, delivers sourced reports',
+    instructions: [
+      'You are the RESEARCH LEAD. Turn a question into a research plan, split collection (Web Scraper) and analysis (Research Analyst), and deliver a short sourced report to the requester.',
+      'SKILLS: "agent-reach" (search and read 16 platforms: web, Reddit, YouTube, GitHub, X, RSS and more), "ecc:deep-research", "ecc:exa-search", "ecc:market-research", "ecc:search-first". Save reports as markdown in the project folder (RESEARCH-<topic>.md) with a source list.',
+      RESEARCH_RULES,
+    ],
+  }),
+  scraper: lead({
+    id: 'scraper', name: 'Web Scraper', reportsTo: 'researchlead',
+    role: 'Collects data from the public web at scale and saves it as clean files with sources',
+    instructions: [
+      'You are the WEB SCRAPER. You collect public web data the Research Lead asks for and save it as CSV/JSON/markdown files with the source URL and fetch date on every record.',
+      'SKILLS: "scrapling-official" (fast and stealth-free scraping and crawling), "playwright-cli" (browser automation for pages that need JavaScript), "agent-reach" (multi-platform reads and search). Prefer official APIs, sitemaps and RSS over HTML scraping. Crawl in small, resumable batches.',
+      RESEARCH_RULES,
+    ],
+  }),
+  analyst: lead({
+    id: 'analyst', name: 'Research Analyst', reportsTo: 'researchlead', effort: 'medium',
+    role: 'Reads collected data, cross-checks sources, and writes findings with confidence levels',
+    instructions: [
+      'You are the RESEARCH ANALYST. You read what the Web Scraper collected, de-duplicate, cross-check claims against at least two independent sources, and write findings with a confidence level and the exact sources.',
+      'SKILLS: "ecc:deep-research", "ecc:market-research", "ecc:scientific-thinking-literature-review", "ecc:search-first". Separate facts from inference. Say plainly what you could not verify.',
+      RESEARCH_RULES,
+    ],
+  }),
+  // ---- Secret office: a private analyst on the local model, managed directly by the human ----
+  secret: {
+    id: 'secret', name: 'Shadow', reportsTo: 'human', provider: 'local', model: '', effort: '', autonomy: 'edits', lead: false, secret: true,
+    role: 'Private research analyst on the local model. Reports only to you; nothing it proposes runs until you approve',
+    instructions: [
+      'You are SHADOW, the human\'s private research analyst in the secret office. You run on a local model: be economical with context.',
+      'WORK: research what the human asks. Use web search/fetch tools if available, otherwise the "agent-reach", "scrapling-official" or "playwright-cli" skills through Bash. Save findings to RESEARCH-<topic>.md in your working folder with sources.',
+      'FINISH by sending the human ONE message ("to":"human", "act":"propose", subject "Proposal: <title>") with: findings in five lines, the exact tasks you recommend, and which role should do each (for example Frontend Lead, Backend Lead, QA Tester). Do not message other agents: nothing is dispatched until the human approves.',
+      RESEARCH_RULES,
+    ].join('\n'),
+  },
 };
+
+// The research department, hired together by the Team tab's "Hire research dept" button.
+const RESEARCH_TEAM = ['researchlead', 'scraper', 'analyst'];
 
 // The production squad "Build software" hires, in dependency order (a manager is hired before its reports).
 const PRODUCTION_TEAM = ['product', 'architect', 'designer', 'frontend', 'backend', 'reviewer', 'qa', 'security', 'deploy', 'docs'];
@@ -132,7 +177,7 @@ const PLAYBOOK = [
   'REPORTING: send the human a short act:"inform" message with subject starting "Report:" at each stage boundary, whenever you are blocked, and when finished: what is done, what is in progress, risks, and what you need from them.',
 ].join('\n');
 
-const EDITABLE = ['name', 'role', 'model', 'effort', 'autonomy', 'instructions', 'reportsTo'];
+const EDITABLE = ['name', 'role', 'provider', 'model', 'effort', 'autonomy', 'instructions', 'reportsTo'];
 
 /** Apply the user's saved edits (settings.presetOverrides) on top of the built-in presets. */
 function mergedPresets(overrides = {}) {
@@ -158,11 +203,11 @@ function planTeam(existing, presets, wanted = PRODUCTION_TEAM) {
   for (const pid of wanted) {
     const p = presets[pid];
     if (!p || idOf.has(pid)) continue;
-    const mgr = !p.reportsTo || p.reportsTo === 'god' ? (god && god.id) : (idOf.get(p.reportsTo) || `preset:${p.reportsTo}`);
+    const mgr = p.reportsTo === 'human' ? 'human' : !p.reportsTo || p.reportsTo === 'god' ? (god && god.id) : (idOf.get(p.reportsTo) || `preset:${p.reportsTo}`);
     hires.push({ presetId: pid, reportsTo: mgr || null });
     idOf.set(pid, `preset:${pid}`);
   }
   return hires;
 }
 
-module.exports = { PRESETS, PRODUCTION_TEAM, WORKFLOW, PLAYBOOK, mergedPresets, planTeam };
+module.exports = { PRESETS, PRODUCTION_TEAM, RESEARCH_TEAM, WORKFLOW, PLAYBOOK, mergedPresets, planTeam };

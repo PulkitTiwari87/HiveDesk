@@ -60,6 +60,22 @@ class Mirror {
   constructor() { this.cache = new Map(); } // session id -> { file, mtime, summary }
 
   /** Recent sessions, newest first. `skip` = session ids that Hivedesk agents own (they have their own terminal). */
+  /** Delete one Claude Code transcript (and its same-named folder) by exact session id. Only ever touches `<id>.jsonl` / `<id>/` under projects/. */
+  deleteSession(id) {
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(id))) return false;
+    const root = path.join(configDir(), 'projects');
+    let removed = false;
+    this.cache.delete(id);
+    let dirs = [];
+    try { dirs = fs.readdirSync(root); } catch { return false; }
+    for (const d of dirs) {
+      const file = path.join(root, d, `${id}.jsonl`), folder = path.join(root, d, id);
+      try { if (fs.statSync(file).isFile()) { fs.unlinkSync(file); removed = true; } } catch { /* not in this project */ }
+      try { if (fs.statSync(folder).isDirectory()) fs.rmSync(folder, { recursive: true, force: true }); } catch { /* none */ }
+    }
+    return removed;
+  }
+
   list(skip = new Set()) {
     const root = path.join(configDir(), 'projects');
     const found = [];

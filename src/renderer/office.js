@@ -11,8 +11,8 @@
   const MIN_H = 216, TOP = 34, LEFT = 8, CELL_W = 58, CELL_H = 58, BREAK_W = 74, SPEED = 38, HEAD = 26, HALL = 18, GAP = 4, PAD = 3; // HEAD leaves room for the name above the first row's speech bubbles
   let CORR_X = 0, W = 0; // corridor x and world width follow the window
   // Rooms: your office, the orchestrator's office, then one room per team (a lead and everyone under them).
-  const TEAM_LABEL = { product: 'Product & Design', architect: 'Engineering', security: 'Security (SOC)', deploy: 'Deployment' };
-  const TEAM_ORDER = ['product', 'architect', 'security', 'deploy'];
+  const TEAM_LABEL = { product: 'Product & Design', architect: 'Engineering', security: 'Security (SOC)', deploy: 'Deployment', researchlead: 'Research Dept' };
+  const TEAM_ORDER = ['product', 'architect', 'security', 'deploy', 'researchlead'];
   const ROOM_COLORS = ['#f6c445', '#6ea8fe', '#7bd88f', '#ef8a62', '#b190ff', '#5fd3e8', '#f07ab8'];
   const SPOTS = [
     { k: 'cooler', x: 272, y: 52, emote: '\u{1F4A7}' },
@@ -57,9 +57,10 @@
       }
       return cur;
     };
-    const teams = new Map();
+    const teams = new Map(), secretSlots = [];
     list.forEach((a, i) => {
       if (a.isGod) return;
+      if (a.secret) { secretSlots.push(i + 1); return; } // the secret office is its own locked room
       const t = topOf(a);
       if (!teams.has(t.id)) teams.set(t.id, []);
       teams.get(t.id).push(i + 1);
@@ -76,7 +77,8 @@
     named.sort((a, b) => (a.order < 0 ? 99 : a.order) - (b.order < 0 ? 99 : b.order));
     rooms.push(...named);
     if (loose.length) rooms.push({ key: 'general', name: 'General', slots: loose });
-    rooms.forEach((r, i) => { r.idx = i; r.color = ROOM_COLORS[i % ROOM_COLORS.length]; });
+    if (secretSlots.length) rooms.push({ key: 'secret', name: 'Secret office', slots: secretSlots, secret: true });
+    rooms.forEach((r, i) => { r.idx = i; r.color = r.secret ? '#4b3f6b' : ROOM_COLORS[i % ROOM_COLORS.length]; });
     return rooms;
   }
 
@@ -405,11 +407,12 @@
     // rooms: tinted floor, walls, a header band for the name, and a doorway onto the hallway
     for (const bnd of L.bands) fb('#d9ccb0', 4, bnd.y + bnd.h + 3, CORR_X + 2, HALL - 6);
     for (const r of L.rooms) {
-      box2(r.x, r.y, r.w, r.h, '#ebe1cb', '#6b5a45');
-      b.globalAlpha = 0.18; fb(r.color, r.x + 1, r.y + HEAD, r.w - 2, r.h - HEAD - 1);
-      b.globalAlpha = 1; fb('#fbf3df', r.x + 1, r.y + 1, r.w - 2, HEAD - 2);
-      b.globalAlpha = 0.45; fb(r.color, r.x + 1, r.y + 1, r.w - 2, HEAD - 2);
-      b.globalAlpha = 1; fb('#6b5a45', r.x + 1, r.y + HEAD - 1, r.w - 2, 1);
+      box2(r.x, r.y, r.w, r.h, r.secret ? '#d9d2e6' : '#ebe1cb', r.secret ? '#2e2a40' : '#6b5a45');
+      b.globalAlpha = r.secret ? 0.3 : 0.18; fb(r.color, r.x + 1, r.y + HEAD, r.w - 2, r.h - HEAD - 1);
+      b.globalAlpha = 1; fb(r.secret ? '#4b3f6b' : '#fbf3df', r.x + 1, r.y + 1, r.w - 2, HEAD - 2);
+      b.globalAlpha = r.secret ? 0 : 0.45; fb(r.color, r.x + 1, r.y + 1, r.w - 2, HEAD - 2);
+      b.globalAlpha = 1; fb(r.secret ? '#2e2a40' : '#6b5a45', r.x + 1, r.y + HEAD - 1, r.w - 2, 1);
+      if (r.secret) { fb('#f6c445', r.x + r.w - 15, r.y + 8, 8, 6); fb('#2e2a40', r.x + r.w - 13, r.y + 4, 4, 5); fb('#4b3f6b', r.x + r.w - 12, r.y + 6, 2, 3); } // a padlock on the sign
       fb('#ebe1cb', r.x + 1, r.y + r.h - 1, 10, 1); fb('#6b5a45', r.x + 11, r.y + r.h - 2, 1, 2); // doorway above the hallway
     }
     // your office: bookshelf, sofa and a plant beside your desk
@@ -509,8 +512,8 @@
       let label = r.name;
       const maxW = r.w * S - 8 * dpr;
       while (label.length > 3 && g.measureText(label).width > maxW) label = label.slice(0, -2) + '…';
-      g.fillStyle = '#3a2f26';
-      g.fillText(label, X(r.x + r.w / 2), Y(r.y + 9) + dpr * 0.5);
+      g.fillStyle = r.secret ? '#ffffff' : '#3a2f26';
+      g.fillText(label, X(r.x + r.w / 2 - (r.secret ? 4 : 0)), Y(r.y + 9) + dpr * 0.5);
     }
     const n = agents.length + 1;
     for (let i = 0; i < n; i++) {

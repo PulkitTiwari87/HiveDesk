@@ -35,6 +35,8 @@
       <nav class="tabs" id="tabs">
         <button data-tab="floor" class="active">Floor</button>
         <button data-tab="team">Team</button>
+        <button data-tab="secret">Secret office <span class="badge hidden" id="secretBadge">0</span></button>
+        <button data-tab="kb">Knowledge</button>
         <button data-tab="terminal">Terminal</button>
         <button data-tab="live">Claude Code <span class="badge hidden" id="liveBadge">0</span></button>
         <button data-tab="tasks">Tasks</button>
@@ -71,7 +73,39 @@
           <div class="team-side">
             <h3>Crew library</h3>
             <p class="hint">Pre-made leads. Customize edits the template used for future hires; hired agents are customized from the org chart.</p>
+            <div class="org-btns left"><button id="hireResearch" title="Research Lead, Web Scraper and Research Analyst">Hire research dept</button><button id="hireSecret" title="A private analyst on your local model">Open secret office</button></div>
             <div id="crewList" class="crew"></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="tab" id="tab-secret">
+        <div class="secret">
+          <div class="team-sec">
+            <h3>Secret office</h3>
+            <p class="hint">A private analyst on your local model. It reports only to you, other agents cannot see it, and nothing it proposes reaches the team until you approve it below. You can also assign tasks to any agent directly; set an agent's manager to "You" in Customize to manage it yourself.</p>
+            <div id="secretStatus" class="local-status"></div>
+            <div id="secretAgents"></div>
+            <div class="row-actions"><select id="secretTarget"></select><input id="secretTask" placeholder="Assign a task directly to the selected agent"><button class="primary" id="secretAssign">Assign</button></div>
+          </div>
+          <div class="team-sec">
+            <h3>Proposals waiting for your approval</h3>
+            <div id="secretProposals"></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="tab" id="tab-kb">
+        <div class="row-actions">
+          <select id="kbAgent"></select><button id="kbNew">New note</button><button id="kbOpen">Open folder</button>
+          <span class="hint">Notes you curate for each agent. They read the list at the start of a task. .md or .txt only.</span>
+        </div>
+        <div class="kb">
+          <div id="kbList" class="kb-list"></div>
+          <div class="kb-edit">
+            <input id="kbName" placeholder="file-name.md">
+            <textarea id="kbText" class="editor" spellcheck="false" placeholder="Write what this agent should know: conventions, links, decisions, glossary..."></textarea>
+            <div class="row-actions"><button class="primary" id="kbSave">Save note</button><button class="danger" id="kbDelete">Delete note</button></div>
           </div>
         </div>
       </section>
@@ -151,6 +185,7 @@
       <div class="presets" id="hirePresets"></div>
       <input type="hidden" name="instructions">
       <input type="hidden" name="presetId">
+      <input type="hidden" name="secret">
       <input type="hidden" name="lead">
       <input type="hidden" name="reportsTo">
       <label>Name <input name="name" required placeholder="Ada"></label>
@@ -182,6 +217,7 @@
       <label>Name <input name="name" required maxlength="40"></label>
       <label>Role <input name="role"></label>
       <label>Reports to <select name="reportsTo" id="customManager"></select></label>
+      <label>Engine <select name="provider" id="customProvider"></select></label>
       <label>Model <span class="inline"><select id="customModelPick"></select><input name="model" id="customModel" placeholder="or any model id"></span></label>
       <label>Effort
         <select name="effort"><option value="">Default</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="xhigh">XHigh</option><option value="max">Max</option></select>
@@ -215,6 +251,16 @@
       <label class="check"><input type="checkbox" name="restoreAgents"> Restart every agent when the app opens</label>
       <label class="check"><input type="checkbox" name="gitCommit"> Commit the hive to git (audit trail)</label>
       <p class="hint">Orchestrator settings apply the next time it is hired (archive it to re-hire).</p>
+      <fieldset class="local">
+        <legend>Local model (optional)</legend>
+        <label class="check"><input type="checkbox" id="lmEnabled"> Allow agents to use the local model (engine "Claude Code (local model)")</label>
+        <label>Model file (.gguf) <input id="lmGguf"></label>
+        <label>Name in Ollama <input id="lmName"></label>
+        <label>Context window (tokens; Claude Code needs at least 16384) <input id="lmCtx" type="number" min="4096" step="1024"></label>
+        <div id="lmStatus" class="hint"></div>
+        <div class="inline"><button type="button" id="lmSetup">Set up (import the model into Ollama)</button><button type="button" id="lmCheck">Test tool calling</button></div>
+        <pre id="lmLog" class="lm-log hidden"></pre>
+      </fieldset>
       <div class="dialog-actions"><button value="cancel" formnovalidate>Cancel</button><button class="primary" value="ok">Save</button></div>
     </form>
   </dialog>
