@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:">
+  <title>Hivedesk</title>
+  <link rel="stylesheet" href="../../node_modules/@xterm/xterm/css/xterm.css">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="workspace mono" id="workspace" title="Hive folder"></div>
+    <div class="title"><span class="dot"></span>Hivedesk</div>
+    <div class="actions">
+      <button class="primary" id="btnHire">+ Hire agent</button>
+      <button class="ghost" id="btnOpenHive" title="Open the hive folder">Hive folder</button>
+    </div>
+  </header>
+
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="app-id">
+        <span class="mark">HD</span>
+        <div><div class="app-name">Hivedesk</div><div class="app-sub" id="agentCount"></div></div>
+      </div>
+      <div class="side-title">Agents</div>
+      <div id="agentList" class="agent-list"></div>
+      <div class="side-foot">
+        <button class="ghost" id="btnHire2">+ Hire agent</button>
+        <button class="ghost icon" id="btnSettings" title="Settings">&#9881;</button>
+      </div>
+    </aside>
+
+    <main class="main">
+      <nav class="tabs" id="tabs">
+        <button data-tab="floor" class="active">Floor</button>
+        <button data-tab="terminal">Terminal</button>
+        <button data-tab="tasks">Tasks</button>
+        <button data-tab="board">Board</button>
+        <button data-tab="memory">Memory</button>
+        <button data-tab="ask">Ask me <span class="badge hidden" id="askBadge">0</span></button>
+        <button data-tab="log">Log</button>
+      </nav>
+
+      <section class="tab active" id="tab-floor">
+        <div class="floor" id="floor"></div>
+      </section>
+
+      <section class="tab" id="tab-terminal">
+        <div class="term-head" id="termHead"></div>
+        <div class="term-wrap" id="termWrap"><div class="empty">Pick an agent on the left.</div></div>
+      </section>
+
+      <section class="tab" id="tab-tasks">
+        <form class="task-form" id="taskForm">
+          <input name="title" placeholder="New task title" required>
+          <select name="assignee" id="taskAssignee"></select>
+          <input name="notes" placeholder="Details (sent to the assignee)">
+          <button class="primary" type="submit">Add task</button>
+        </form>
+        <div class="kanban" id="kanban"></div>
+      </section>
+
+      <section class="tab" id="tab-board">
+        <div class="row-actions"><button id="boardReload">Reload</button><button class="primary" id="boardSave">Save</button><span class="hint">board.md, the shared plan. God is its usual scribe.</span></div>
+        <textarea id="boardText" class="editor" spellcheck="false"></textarea>
+      </section>
+
+      <section class="tab" id="tab-memory">
+        <div class="row-actions">
+          <select id="memAgent"></select>
+          <input id="memQuery" placeholder="Search every agent's memory">
+          <button id="memSearch">Search</button>
+        </div>
+        <div id="memResults" class="mem-results"></div>
+        <pre id="memText" class="doc"></pre>
+      </section>
+
+      <section class="tab" id="tab-ask">
+        <div id="askList" class="ask-list"></div>
+      </section>
+
+      <section class="tab" id="tab-log">
+        <div id="logList" class="log-list"></div>
+      </section>
+    </main>
+
+    <aside class="right">
+      <div class="brief">
+        <div class="side-title">Brief <span id="godName">the orchestrator</span></div>
+        <textarea id="briefText" placeholder="Tell your orchestrator what you want done. Ctrl+Enter to send."></textarea>
+        <div class="brief-actions">
+          <label><input type="checkbox" id="briefAsMessage"> as inbox message</label>
+          <button class="primary" id="briefSend">Send</button>
+        </div>
+      </div>
+      <div class="side-title">Activity</div>
+      <div id="activity" class="activity"></div>
+    </aside>
+  </div>
+
+  <dialog id="hireDialog">
+    <form method="dialog" id="hireForm" class="dialog-form">
+      <h2>Hire an agent</h2>
+      <label>Name <input name="name" required placeholder="Ada"></label>
+      <label>Role <input name="role" placeholder="Frontend engineer: owns the React UI"></label>
+      <label>Engine <select name="provider" id="hireProvider"></select></label>
+      <label id="hireCommandRow" class="hidden">Command <input name="command" placeholder="aider --model sonnet"></label>
+      <label>Model (optional) <input name="model" placeholder="e.g. sonnet, opus, gpt-5"></label>
+      <label>Autonomy
+        <select name="autonomy">
+          <option value="ask">Ask before acting</option>
+          <option value="edits" selected>Accept file edits</option>
+          <option value="full">Full auto (skip permissions)</option>
+        </select>
+      </label>
+      <label>Working folder
+        <span class="inline"><input name="cwd" id="hireCwd" placeholder="defaults to the workspace"><button type="button" id="hirePick">Browse</button></span>
+      </label>
+      <label>First task (optional) <textarea name="objective" rows="3" placeholder="Sent to its inbox when it starts"></textarea></label>
+      <div class="dialog-actions"><button value="cancel" formnovalidate>Cancel</button><button class="primary" value="ok">Hire</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="settingsDialog">
+    <form method="dialog" id="settingsForm" class="dialog-form">
+      <h2>Settings</h2>
+      <label>Workspace (hive lives in &lt;workspace&gt;/hive)
+        <span class="inline"><input name="workspace" id="setWorkspace"><button type="button" id="setPick">Browse</button></span>
+      </label>
+      <label class="check"><input type="checkbox" name="autoGod"> Auto-hire the orchestrator (god agent)</label>
+      <label>Orchestrator name <input name="godName"></label>
+      <label>Orchestrator engine <select name="godProvider" id="setGodProvider"></select></label>
+      <label>Orchestrator model <input name="godModel" placeholder="default"></label>
+      <label>Orchestrator autonomy
+        <select name="godAutonomy">
+          <option value="ask">Ask before acting</option>
+          <option value="edits">Accept file edits</option>
+          <option value="full">Full auto (skip permissions)</option>
+        </select>
+      </label>
+      <label class="check"><input type="checkbox" name="restoreAgents"> Restart every agent when the app opens</label>
+      <label class="check"><input type="checkbox" name="gitCommit"> Commit the hive to git (audit trail)</label>
+      <p class="hint">Orchestrator settings apply the next time it is hired (archive it to re-hire).</p>
+      <div class="dialog-actions"><button value="cancel" formnovalidate>Cancel</button><button class="primary" value="ok">Save</button></div>
+    </form>
+  </dialog>
+
+  <script src="../../node_modules/@xterm/xterm/lib/xterm.js"></script>
+  <script src="../../node_modules/@xterm/addon-fit/lib/addon-fit.js"></script>
+  <script src="office.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

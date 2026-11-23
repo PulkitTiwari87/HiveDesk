@@ -1,0 +1,67 @@
+{
+  "name": "hivedesk",
+  "productName": "Hivedesk",
+  "version": "0.1.0",
+  "description": "Local multi-agent harness: an office of Claude Code / Codex / Gemini / Copilot agents that message, remember and are run by an orchestrator.",
+  "main": "src/main/main.js",
+  "private": true,
+  "license": "MIT",
+  "author": "Hivedesk contributors",
+  "keywords": ["electron", "ai-agents", "multi-agent", "claude-code", "codex", "gemini-cli", "orchestrator", "pixel-art"],
+  "engines": { "node": ">=18" },
+  "type": "commonjs",
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test test/*.test.js",
+    "dist": "electron-builder --win --publish never"
+  },
+  "dependencies": {
+    "@lydell/node-pty": "^1.1.0",
+    "@xterm/addon-fit": "^0.10.0",
+    "@xterm/xterm": "^5.5.0"
+  },
+  "devDependencies": {
+    "electron": "^33.4.11",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "local.hivedesk.app",
+    "productName": "Hivedesk",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "src/**/*",
+      "build/icon.png",
+      "package.json"
+    ],
+    "asarUnpack": [
+      "node_modules/@lydell/**"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icon.png"
+    },
+    "portable": {
+      "artifactName": "Hivedesk-${version}-portable.exe"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "artifactName": "Hivedesk-${version}-setup.exe"
+    }
+  }
+}
