@@ -55,6 +55,7 @@ function renderAgents() {
   memSel.innerHTML = state.agents.map((a) => `<option value="${esc(a.id)}">${esc(a.name)}</option>`).join('');
   if (cur) memSel.value = cur;
   if (state.selected) renderTermHead();
+  if (state.tab === 'team') loadTeam();
 }
 
 // The floor is a pixel office (office.js): every agent is a character driven by its real status.
@@ -87,10 +88,12 @@ function renderTermHead() {
     <span class="title">${esc(a.name)}</span>
     <span class="meta">${esc(a.provider)}${a.model ? ' · ' + esc(a.model) : ''} · ${esc(a.status)} · ${esc(a.cwd || state.settings.workspace)}</span>
     ${running ? '<button data-act="stop">Stop</button>' : '<button class="primary" data-act="start">Start / resume</button>'}
+    <button data-act="custom" title="Rename, change model, effort, manager and instructions">Customize</button>
     <button data-act="fresh" title="Restart with a brand new session">New session</button>
     <button data-act="folder">Hive folder</button>
     <button data-act="cwd">Work folder</button>
     <button class="danger" data-act="remove">Archive</button>`;
+  renderCtlBar();
   const old = $('#termWrap .err');
   if (old) old.remove();
   if (a.error && state.tab === 'terminal') {
@@ -151,6 +154,7 @@ $('#termHead').addEventListener('click', async (ev) => {
     if (!confirm(`Start ${a.name} with a brand new session? Its conversation history is not resumed.`)) return;
     const r = await window.hd.freshAgent(id); if (!r.ok) toast(r.error, true);
   }
+  if (act === 'custom') { openCustom('agent', id); return; }
   if (act === 'folder') window.hd.openPath(`${state.hiveRoot}\\agents\\${id}`);
   if (act === 'cwd') window.hd.openPath(a.cwd || state.settings.workspace);
   if (act === 'remove') {
@@ -163,21 +167,264 @@ $('#termHead').addEventListener('click', async (ev) => {
   await refreshAgents();
 });
 
+// ---------------- model / effort control bar (Claude agents) ----------------
+const MODELS = [['', 'Default'], ['fable', 'Fable'], ['opus', 'Opus'], ['sonnet', 'Sonnet'], ['haiku', 'Haiku']];
+const EFFORT_LEVELS = [['', 'Default'], ['low', 'Low'], ['medium', 'Medium'], ['high', 'High'], ['xhigh', 'XHigh'], ['max', 'Max']];
+
+function renderCtlBar() {
+  const bar = $('#ctlBar');
+  const a = agentById(state.selected);
+  if (!a || a.provider !== 'claude') { bar.classList.add('hidden'); return; }
+  if (document.activeElement && document.activeElement.id === 'ctlModel') return; // never rebuild under the user's typing
+  const cur = { model: a.model || '', effort: a.effort || '' };
+  const seg = (kind, opts) => `<div class="seg" role="group" aria-label="${kind}">${opts.map(([v, l]) => `<button type="button" data-${kind}="${v}" class="${cur[kind] === v ? 'on' : ''}" aria-pressed="${cur[kind] === v}">${l}</button>`).join('')}</div>`;
+  const custom = cur.model && !MODELS.some(([v]) => v === cur.model);
+  bar.innerHTML = `<span class="lbl">Model</span>${seg('model', MODELS)}
+    <input id="ctlModel" placeholder="custom model id" value="${custom ? esc(cur.model) : ''}" title="Any model id or alias, press Enter" aria-label="Custom model id">
+    <span class="lbl">Effort</span>${seg('effort', EFFORT_LEVELS)}
+    <span class="hint">${RUNNING.includes(a.status) ? 'Applies live (/model, /effort) once the agent is idle' : 'Saved for the next start'}</span>`;
+  bar.classList.remove('hidden');
+}
+async function applyCtl(patch) {
+  const a = agentById(state.selected);
+  if (!a) return;
+  const r = await window.hd.configureAgent(a.id, patch);
+  if (!r.ok) { toast(r.error, true); return; }
+  const what = patch.model !== undefined ? `model ${patch.model || 'default'}` : `effort ${patch.effort || 'default'}`;
+  toast({ now: `${a.name}: ${what} applied`, 'when idle': `${a.name}: ${what} queued until idle`, 'next start': `${a.name}: ${what} saved for the next start` }[r.applied] || 'Saved');
+  await refreshAgents();
+}
+$('#ctlBar').addEventListener('click', (e) => {
+  const b = e.target.closest('button');
+  if (!b) return;
+  if ('model' in b.dataset) applyCtl({ model: b.dataset.model });
+  else if ('effort' in b.dataset) applyCtl({ effort: b.dataset.effort });
+});
+$('#ctlBar').addEventListener('keydown', (e) => { if (e.key === 'Enter' && e.target.id === 'ctlModel') applyCtl({ model: e.target.value.trim() }); });
+
+// ---------------- Claude Code mirror: every chat you run in Claude Code, read-only ----------------
+const live = { sessions: [], selected: null, key: '', lastPrompt: '', last: 0 };
+const ago = (ms) => { const s = Math.max(0, (Date.now() - ms) / 1000); return s < 60 ? 'just now' : s < 3600 ? `${Math.floor(s / 60)}m ago` : s < 86400 ? `${Math.floor(s / 3600)}h ago` : `${Math.floor(s / 86400)}d ago`; };
+
+async function pollLive(force) {
+  if (!force && state.tab !== 'live' && Date.now() - live.last < 15000) return; // cheap background refresh for the badge
+  live.last = Date.now();
+  live.sessions = await window.hd.mirrorList();
+  const working = live.sessions.filter((s) => s.working).length;
+  $('#liveBadge').textContent = working;
+  $('#liveBadge').classList.toggle('hidden', !working);
+  if (state.tab !== 'live') return;
+  renderLiveList();
+  if (live.selected) await renderLiveChat(force);
+}
+function renderLiveList() {
+  $('#liveList').innerHTML = live.sessions.map((s) => `
+    <div class="live-item ${s.id === live.selected ? 'selected' : ''} ${s.working ? 'working' : ''}" data-id="${esc(s.id)}">
+      <div class="li-top"><span class="dot"></span><b>${esc(s.project)}</b><span class="hint">${esc(s.working ? 'working' : ago(s.mtime))}</span></div>
+      <div class="li-title">${esc(s.title)}</div>
+      ${s.model ? `<span class="chip">${esc(s.model)}</span>` : ''}
+    </div>`).join('') || '<div class="empty small">No Claude Code chats in the last 3 days.</div>';
+}
+async function renderLiveChat(reset) {
+  const s = live.sessions.find((x) => x.id === live.selected);
+  if (!s) return;
+  $('#liveHead').innerHTML = `<span class="title">${esc(s.project)}</span><span class="meta">${esc(s.cwd)}${s.model ? ' · ' + esc(s.model) : ''} · ${s.working ? 'working' : 'idle'}</span>`;
+  const r = await window.hd.mirrorRead(s.id, 200);
+  const box = $('#liveMsgs');
+  if (!r.ok) { box.innerHTML = `<div class="empty">${esc(r.error)}</div>`; return; }
+  const key = `${s.id}:${r.messages.length}:${r.mtime}`;
+  if (key === live.key && !reset) return;
+  live.key = key;
+  const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
+  box.innerHTML = r.messages.map((m) => m.role === 'tool'
+    ? `<div class="msg tool"><span class="chip">${esc(m.name)}</span><span class="mono">${esc(m.text)}</span></div>`
+    : `<div class="msg ${m.role}"><div class="who">${m.role === 'user' ? 'You' : 'Claude'}<span class="hint">${esc(time(m.t))}</span></div><div class="body">${esc(m.text)}</div></div>`).join('') || '<div class="empty">No messages to show yet.</div>';
+  if (reset || atBottom) box.scrollTop = box.scrollHeight;
+  const lastUser = [...r.messages].reverse().find((m) => m.role === 'user');
+  live.lastPrompt = lastUser ? lastUser.text : '';
+  $('#liveDelegate').classList.remove('hidden');
+  const sel = $('#liveAgent');
+  if (sel.options.length !== state.agents.length) {
+    const g = god();
+    sel.innerHTML = state.agents.map((a) => `<option value="${esc(a.id)}">${esc(a.name)}${a.isGod ? ' (orchestrator)' : ''}</option>`).join('');
+    if (g) sel.value = g.id;
+  }
+}
+$('#liveList').addEventListener('click', (e) => {
+  const el = e.target.closest('.live-item');
+  if (!el) return;
+  live.selected = el.dataset.id;
+  renderLiveList();
+  renderLiveChat(true);
+});
+$('#liveSend').onclick = async () => {
+  const to = $('#liveAgent').value;
+  const s = live.sessions.find((x) => x.id === live.selected);
+  const text = $('#liveTask').value.trim() || live.lastPrompt;
+  if (!to) { toast('Hire an agent first', true); return; }
+  if (!s || !text) { toast('Nothing to delegate yet', true); return; }
+  await window.hd.sendMessage({ to, act: 'request', subject: text.split('\n')[0].slice(0, 80), body: `${text}\n\n(Delegated from the Claude Code chat "${s.title}" in ${s.cwd}.)` });
+  $('#liveTask').value = '';
+  toast(`Delegated to ${nameOf(to)}`);
+};
+setInterval(() => pollLive(false), 3000);
+
 // ---------------- tabs ----------------
 function showTab(tab) {
   state.tab = tab;
   document.querySelectorAll('#tabs button').forEach((b) => b.classList.toggle('active', b.dataset.tab === tab));
   document.querySelectorAll('.tab').forEach((s) => s.classList.toggle('active', s.id === `tab-${tab}`));
   window.Office.setActive(tab === 'floor');
+  if (tab === 'team') loadTeam();
   if (tab === 'tasks') loadTasks();
   if (tab === 'board') loadBoard();
   if (tab === 'memory') loadMemory();
   if (tab === 'ask') loadAsk();
   if (tab === 'log') loadLog();
   if (tab === 'terminal' && state.selected) showTerminal(state.selected);
+  if (tab === 'live') pollLive(true);
 }
 $('#tabs').addEventListener('click', (e) => { const b = e.target.closest('button'); if (b) showTab(b.dataset.tab); });
 $('#agentList').addEventListener('click', (e) => { const el = e.target.closest('.agent'); if (el) selectAgent(el.dataset.id); });
+
+// ---------------- team: org chart, crew library, workflow, customize ----------------
+// Chain of command: you > orchestrator (god) > managers > employees. An unknown or looping manager means "the orchestrator".
+function managerOf(a) {
+  if (a.isGod) return null;
+  const ids = new Set(state.agents.map((x) => x.id));
+  const g = god();
+  if (!a.reportsTo || a.reportsTo === a.id || !ids.has(a.reportsTo)) return g ? g.id : null;
+  return a.reportsTo;
+}
+function descendants(id, seen = new Set()) {
+  for (const a of state.agents) if (!seen.has(a.id) && managerOf(a) === id) { seen.add(a.id); descendants(a.id, seen); }
+  return seen;
+}
+const agentForPreset = (pid) => state.agents.find((a) => a.presetId === pid);
+const presetName = (pid) => (state.presets[pid] ? state.presets[pid].name : pid);
+
+function orgNode(a, depth) {
+  const kids = state.agents.filter((x) => x.id !== a.id && managerOf(x) === a.id);
+  return `<div class="org-node" style="--d:${depth}">
+      <div class="org-card st-${esc(a.status)}" data-id="${esc(a.id)}">
+        <div class="avatar" style="--c:${colorFor(a.id)}">${esc(initials(a.name))}</div>
+        <div class="who"><div class="name">${esc(a.name)}${a.isGod ? ' <span class="star">&#9733;</span>' : ''}</div>
+          <div class="sub">${esc(a.role)}</div>
+          <div class="sub">${esc(STATUS_LABEL[a.status] || a.status)} · ${esc(PROVIDER_SHORT[a.provider] || a.provider)}${a.model ? ' · ' + esc(a.model) : ''}${a.effort ? ' · ' + esc(a.effort) : ''}${kids.length ? ` · ${kids.length} report${kids.length === 1 ? '' : 's'}` : ''}</div></div>
+        <div class="org-btns"><button data-act="open">Open</button><button data-act="custom">Customize</button></div>
+      </div>${kids.map((k) => orgNode(k, depth + 1)).join('')}</div>`;
+}
+function renderOrg() {
+  const g = god();
+  const seen = new Set(g ? [g.id, ...descendants(g.id)] : []);
+  const strays = state.agents.filter((a) => !seen.has(a.id) && a !== g);
+  $('#orgTree').innerHTML = `<div class="org-node" style="--d:0"><div class="org-card you"><div class="avatar" style="--c:#8e8e93">YOU</div><div class="who"><div class="name">You</div><div class="sub">The orchestrator reports to you</div></div></div>
+    ${g ? orgNode(g, 1) : '<div class="empty small">No orchestrator yet.</div>'}${strays.map((a) => orgNode(a, 1)).join('')}</div>`;
+}
+function renderCrew() {
+  $('#crewList').innerHTML = Object.values(state.presets || {}).map((p) => {
+    const hired = agentForPreset(p.id);
+    const boss = p.reportsTo === 'god' || !p.reportsTo ? 'orchestrator' : presetName(p.reportsTo);
+    return `<div class="crew-card" data-preset="${esc(p.id)}">
+      <div class="who"><div class="name">${esc(p.name)}${p.customized ? ' <span class="chip">edited</span>' : ''}${hired ? ' <span class="chip ok">hired</span>' : ''}</div>
+        <div class="sub">${esc(p.role)}</div><div class="sub">Reports to ${esc(boss)} · ${esc(p.model || 'default model')} · ${esc(p.effort || 'default')} effort</div></div>
+      <div class="org-btns"><button data-act="hire">${hired ? 'Hire another' : 'Hire'}</button><button data-act="custom">Customize</button></div>
+    </div>`;
+  }).join('');
+  const prev = new Set([...document.querySelectorAll('#teamRoles input:not(:checked)')].map((i) => i.value));
+  $('#teamRoles').innerHTML = (state.productionTeam || []).map((pid) => `<label class="check"><input type="checkbox" value="${esc(pid)}" ${prev.has(pid) ? '' : 'checked'}> ${esc(presetName(pid))}${agentForPreset(pid) ? ' (hired)' : ''}</label>`).join('');
+}
+function renderWorkflow() {
+  $('#workflow').innerHTML = (state.workflow || []).map((s, i) => `<div class="wf-step"><div class="wf-n">${i + 1}</div><div>
+      <div class="name">${esc(s.stage)} <span class="hint">${s.who.map((w) => esc(w === 'god' ? (god() ? god().name : 'Orchestrator') : presetName(w))).join(' + ')}</span></div>
+      <div class="sub">${esc(s.does)}</div><div class="sub mono">&rarr; ${esc(s.out)}</div></div></div>`).join('');
+}
+function loadTeam() { renderOrg(); renderCrew(); renderWorkflow(); }
+
+$('#orgTree').addEventListener('click', (e) => {
+  const act = e.target.dataset.act, card = e.target.closest('.org-card');
+  if (!act || !card || !card.dataset.id) return;
+  if (act === 'open') selectAgent(card.dataset.id);
+  if (act === 'custom') openCustom('agent', card.dataset.id);
+});
+$('#crewList').addEventListener('click', (e) => {
+  const act = e.target.dataset.act, card = e.target.closest('.crew-card');
+  if (!act || !card) return;
+  if (act === 'custom') openCustom('preset', card.dataset.preset);
+  if (act === 'hire') { $('#btnHire').click(); applyPreset(card.dataset.preset); }
+});
+$('#teamPick').onclick = async () => { const p = await window.hd.pickFolder(); if (p) $('#teamCwd').value = p; };
+$('#teamLaunch').onclick = async () => {
+  const brief = $('#teamBrief').value.trim();
+  const wanted = [...document.querySelectorAll('#teamRoles input:checked')].map((i) => i.value);
+  if (!brief) { toast('Describe what to build first', true); return; }
+  const need = wanted.filter((pid) => !agentForPreset(pid)).length;
+  if (!confirm(`Start the build?\n\nThis hires and starts ${need} new agent process${need === 1 ? '' : 'es'} (each uses your Claude plan) and sends your brief to ${god() ? god().name : 'the orchestrator'}. Deployments still need your approval.`)) return;
+  const r = await window.hd.launchTeam({ brief, cwd: $('#teamCwd').value.trim(), wanted });
+  if (!r.ok) { toast(r.error, true); return; }
+  $('#teamBrief').value = '';
+  toast(r.hired.length ? `Hired ${r.hired.join(', ')}; brief sent to the orchestrator` : 'Brief sent to the orchestrator');
+  await refreshAgents();
+  loadTeam();
+};
+
+// Customize: one dialog for a hired agent (kind "agent") or a crew-library template (kind "preset").
+const custom = { kind: '', id: '' };
+function openCustom(kind, id) {
+  const f = $('#customForm').elements;
+  const src = kind === 'agent' ? agentById(id) : (state.presets || {})[id];
+  if (!src) return;
+  Object.assign(custom, { kind, id });
+  $('#customTitle').textContent = `Customize ${src.name}`;
+  f.name.value = src.name; f.role.value = src.role || ''; f.model.value = src.model || ''; f.effort.value = src.effort || '';
+  f.autonomy.value = src.autonomy || 'edits'; f.instructions.value = src.instructions || '';
+  $('#customModelPick').innerHTML = MODELS.map(([v, l]) => `<option value="${v}">${l}</option>`).join('');
+  $('#customModelPick').value = MODELS.some(([v]) => v === (src.model || '')) ? (src.model || '') : '';
+  let opts;
+  if (kind === 'agent') {
+    const banned = descendants(id); banned.add(id);
+    opts = state.agents.filter((a) => !banned.has(a.id)).map((a) => [a.id, a.isGod ? `${a.name} (orchestrator)` : a.name]);
+    $('#customManager').disabled = !!src.isGod;
+    $('#customManager').innerHTML = src.isGod ? '<option>You</option>' : opts.map(([v, l]) => `<option value="${esc(v)}">${esc(l)}</option>`).join('');
+    if (!src.isGod) $('#customManager').value = managerOf(src) || '';
+  } else {
+    opts = [['god', 'The orchestrator'], ...Object.values(state.presets).filter((p) => p.id !== id).map((p) => [p.id, p.name])];
+    $('#customManager').disabled = false;
+    $('#customManager').innerHTML = opts.map(([v, l]) => `<option value="${esc(v)}">${esc(l)}</option>`).join('');
+    $('#customManager').value = src.reportsTo || 'god';
+  }
+  $('#customReset').classList.toggle('hidden', !(kind === 'preset' && src.customized));
+  $('#customHint').textContent = kind === 'agent'
+    ? 'Model and effort apply live to a running Claude agent. Name, role, manager, autonomy and instructions apply on its next start (Terminal > Start / resume or New session).'
+    : 'Applies to future hires from the crew library. Agents already hired are not changed.';
+  $('#customDialog').showModal();
+}
+$('#customModelPick').onchange = (e) => { $('#customModel').value = e.target.value; };
+$('#customReset').onclick = async () => {
+  const r = await window.hd.resetPreset(custom.id);
+  state.presets = r.presets;
+  $('#customDialog').close('cancel');
+  loadTeam();
+  toast('Preset reset to its default');
+};
+$('#customDialog').addEventListener('close', async () => {
+  if ($('#customDialog').returnValue !== 'ok') return;
+  const f = $('#customForm').elements;
+  const patch = { name: f.name.value, role: f.role.value, model: f.model.value.trim(), effort: f.effort.value, autonomy: f.autonomy.value, instructions: f.instructions.value };
+  let r;
+  if (custom.kind === 'agent') {
+    if (!f.reportsTo.disabled) patch.reportsTo = f.reportsTo.value;
+    r = await window.hd.updateAgent(custom.id, patch);
+    if (r.ok) toast(r.needsRestart ? 'Saved. Name, role, manager and instructions apply on its next start' : 'Saved');
+  } else {
+    patch.reportsTo = f.reportsTo.value;
+    r = await window.hd.savePreset(custom.id, patch);
+    if (r.ok) { state.presets = r.presets; toast('Preset saved for future hires'); }
+  }
+  if (!r.ok) toast(r.error, true);
+  await refreshAgents();
+  if (state.tab === 'team') loadTeam();
+});
 
 // ---------------- tasks ----------------
 const STATUSES = ['todo', 'doing', 'blocked', 'done'];
@@ -284,6 +531,7 @@ function describe(ev) {
     case 'agent-exited': return `<b>${esc(nameOf(ev.agent))}</b> exited (code ${esc(ev.code)})`;
     case 'agent-woken': return `Woke <b>${esc(nameOf(ev.agent))}</b> for ${esc(ev.messages)} message(s)`;
     case 'stop-blocked': return `<b>${esc(nameOf(ev.agent))}</b> kept working: ${esc(ev.messages)} new message(s)`;
+    case 'agent-configured': return `<b>${esc(nameOf(ev.agent))}</b> switched to ${esc([ev.model, ev.effort && ev.effort + ' effort'].filter(Boolean).join(', ') || 'defaults')}`;
     case 'agent-archived': return `Archived <b>${esc(nameOf(ev.agent))}</b>`;
     case 'spawn-request-done': return `God spawned a worker (${esc(ev.file)})`;
     case 'spawn-request-failed': return `Spawn request failed: ${esc(ev.reason)}`;
@@ -329,8 +577,24 @@ $('#briefText').addEventListener('keydown', (e) => { if (e.key === 'Enter' && e.
 function providerOptions(sel, current) {
   sel.innerHTML = Object.entries(state.providers).map(([k, v]) => `<option value="${k}" ${k === current ? 'selected' : ''}>${esc(v.label)}${v.installed ? '' : ' (not found)'}</option>`).join('');
 }
+function applyPreset(pid) {
+  const p = (state.presets || {})[pid];
+  if (!p) return;
+  const f = $('#hireForm').elements;
+  const boss = p.reportsTo && p.reportsTo !== 'god' ? agentForPreset(p.reportsTo) : null;
+  f.name.value = p.name;
+  f.role.value = p.role; f.provider.value = p.provider; f.model.value = p.model; f.effort.value = p.effort;
+  f.autonomy.value = p.autonomy; f.instructions.value = p.instructions;
+  f.presetId.value = p.id; f.lead.value = p.lead ? '1' : ''; f.reportsTo.value = boss ? boss.id : (god() ? god().id : '');
+  $('#hireCommandRow').classList.toggle('hidden', p.provider !== 'custom');
+}
+$('#hirePresets').addEventListener('click', (e) => {
+  const b = e.target.closest('[data-preset]');
+  if (b) applyPreset(b.dataset.preset);
+});
 $('#btnHire').onclick = () => {
   $('#hireForm').reset();
+  $('#hirePresets').innerHTML = Object.entries(state.presets || {}).map(([k, v]) => `<button type="button" data-preset="${esc(k)}" title="${esc(v.role)}">+ ${esc(v.name)}</button>`).join('');
   providerOptions($('#hireProvider'), 'claude');
   $('#hireCommandRow').classList.add('hidden');
   $('#hireDialog').showModal();
@@ -411,7 +675,7 @@ setInterval(async () => {
 
 async function init() {
   const s = await window.hd.state();
-  Object.assign(state, { settings: s.settings, providers: s.providers, agents: s.agents, hiveRoot: s.hiveRoot });
+  Object.assign(state, { settings: s.settings, providers: s.providers, agents: s.agents, hiveRoot: s.hiveRoot, presets: s.presets, productionTeam: s.productionTeam, workflow: s.workflow });
   $('#workspace').textContent = s.hiveRoot;
   if (!state.selected && god()) state.selected = god().id;
   renderAgents();

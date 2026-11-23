@@ -19,6 +19,9 @@ const TRUST_PROMPT = /trust\s*this\s*folder|trust\s*the\s*files|Do\s*you\s*trust
 const CLAUDE_ENV_KEEP = new Set(['CLAUDE_CONFIG_DIR', 'CLAUDE_CODE_OAUTH_TOKEN', 'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX', 'CLAUDE_CODE_GIT_BASH_PATH']);
 const ANSI =/\x1b\[[0-9;?]*[ -\/]*[@-~]|\x1b\][^\x07]*(\x07|\x1b\\)/g;
 
+const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
+const MODEL_RE = /^[\w.\-:\/\[\]]{1,80}$/; // alias or full model id; no spaces or control characters (it may be typed into a TUI)
+
 const PROVIDERS = {
   claude: { label: 'Claude Code', bin: 'claude', hooks: true },
   codex: { label: 'OpenAI Codex', bin: 'codex' },
@@ -88,6 +91,53 @@ class AgentManager extends EventEmitter {
     s.status = status;
     if (extra.lastTool !== undefined) s.lastTool = extra.lastTool;
     if (changed) this.emit('status', id, this.info(id));
+    if (status === 'idle' && s.pending) this.applyPending(id);
+  }
+
+  /** Change model / effort. Always saved for the next start; a running Claude agent also gets
+   *  /model and /effort typed into its terminal, immediately if idle, otherwise when it next goes idle. */
+  configure(id, { model, effort } = {}) {
+    const patch = {};
+    if (model !== undefined) {
+      const m = String(model).trim();
+      if (m && !MODEL_RE.test(m)) return { ok: false, error: 'That is not a valid model name.' };
+      patch.model = m;
+    }
+    if (effort !== undefined) {
+      if (effort && !EFFORTS.includes(effort)) return { ok: false, error: `Effort must be one of: ${EFFORTS.join(', ')}.` };
+      patch.effort = effort || '';
+    }
+    const meta = this.hive.updateAgent(id, patch);
+    if (!meta) return { ok: false, error: 'unknown agent' };
+    const s = this.sessions.get(id);
+    if (!s || !s.proc || meta.provider !== 'claude') return { ok: true, applied: 'next start' };
+    // Clearing back to "default" has no slash command: that part waits for the next start.
+    const live = { ...(patch.model ? { model: patch.model } : {}), ...(patch.effort ? { effort: patch.effort } : {}) };
+    if (!Object.keys(live).length) return { ok: true, applied: 'next start' };
+    s.pending = { ...s.pending, ...live };
+    if (s.status === 'idle') { this.applyPending(id); return { ok: true, applied: 'now' }; }
+    return { ok: true, applied: 'when idle' };
+  }
+
+  applyPending(id) {
+    const s = this.sessions.get(id);
+    if (!s || !s.pending || !s.proc) return;
+    const { model, effort } = s.pending;
+    s.pending = null;
+    const cmds = [model && `/model ${model}`, effort && `/effort ${effort}`].filter(Boolean);
+    // One slash command at a time per agent: a second change must not be typed before the first one's Enter.
+    let at = Math.max(0, (s.slashUntil || 0) - Date.now());
+    for (const c of cmds) {
+      setTimeout(() => {
+        // Written straight to the terminal: a slash command is not a turn, so it must not flip the status to working.
+        if (!s.proc) return;
+        s.proc.write(c);
+        setTimeout(() => { if (s.proc) s.proc.write('\r'); }, 400);
+      }, at);
+      at += 1500;
+    }
+    s.slashUntil = Date.now() + at;
+    this.hive.log({ type: 'agent-configured', agent: id, model: model || '', effort: effort || '' });
   }
 
   /** Build {file, args, env, typedPrompt} for an agent. */
@@ -116,11 +166,14 @@ class AgentManager extends EventEmitter {
     const args = [];
     let typedPrompt = null;
     let resolved;
+    let rawArgs = null;
 
     if (meta.provider === 'custom') {
       const cmdline = meta.command || (IS_WIN ? 'powershell.exe' : 'bash');
+      // On Windows hand cmd the line verbatim: node-pty would turn every " into \" which cmd does not understand.
+      if (IS_WIN) rawArgs = `/d /s /c "${cmdline}"`;
       resolved = IS_WIN
-        ? { file: process.env.ComSpec || 'cmd.exe', pre: ['/d', '/s', '/c', cmdline] }
+        ? { file: process.env.ComSpec || 'cmd.exe', pre: [] }
         : { file: '/bin/sh', pre: ['-c', cmdline] };
       if (!resuming) typedPrompt = oneLine(this.hive.prompt(meta));
     } else {
@@ -135,6 +188,7 @@ class AgentManager extends EventEmitter {
       if (resuming) args.push('--resume', meta.sessionId);
       else args.push('--session-id', meta.sessionId);
       if (meta.model) args.push('--model', meta.model);
+      if (EFFORTS.includes(meta.effort)) args.push('--effort', meta.effort);
       if (meta.autonomy === 'edits') args.push('--permission-mode', 'acceptEdits');
       if (meta.autonomy === 'full') args.push('--dangerously-skip-permissions');
     } else if (meta.provider === 'codex') {
@@ -155,7 +209,7 @@ class AgentManager extends EventEmitter {
       if (!resuming) typedPrompt = oneLine(this.hive.prompt(meta));
     }
 
-    return { file: resolved.file, args: [...resolved.pre, ...args], env, typedPrompt, hooks: !!prov.hooks, plain: !!prov.plain };
+    return { file: resolved.file, args: rawArgs !== null ? rawArgs : [...resolved.pre, ...args], env, typedPrompt, hooks: !!prov.hooks, plain: !!prov.plain };
   }
 
   writeClaudeSettings(meta) {
@@ -359,4 +413,4 @@ class AgentManager extends EventEmitter {
   }
 }
 
-module.exports = { AgentManager, PROVIDERS, resolveCommand };
+module.exports = { AgentManager, PROVIDERS, EFFORTS, resolveCommand };

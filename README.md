@@ -74,6 +74,14 @@ Claude needs your permission to use Bash
 - **Your desk**: brief the orchestrator, hire agents, run a kanban **Tasks** board, answer **Ask me**, search **Memory**,
   watch the **Log**, and use the full xterm **Terminal** of any agent.
 - **Autonomy levels** per agent: ask before acting, accept file edits (default), or full auto.
+- **Model and effort bar**: open any Claude agent's **Terminal** tab and switch its model (Fable, Opus, Sonnet, Haiku or any id)
+  and effort (Low to Max) with one click. A running agent gets `/model` and `/effort` typed for it as soon as it is idle;
+  the choice is also saved, so the next start launches with `--model` and `--effort`.
+- **Claude Code mirror**: the **Claude Code** tab shows every chat you run in Claude Code (terminal, desktop app or IDE) live and
+  read-only, by reading the transcripts Claude Code already writes under `~/.claude/projects`. Nothing in your Claude settings
+  is changed. **Delegate to agent** sends that chat's last prompt, or a task you type, to any Hivedesk agent.
+- **Designer**: a one-click **+ Designer** hire in the Hire dialog: a head designer whose standing instructions tell it to use the
+  `apple-design`, `impeccable`, `ui-ux-pro-max` and other design skills you have installed, set direction and review UI work.
 - **Audit trail**: the app is the only git committer of the hive, so every change to it is a commit (if `git` is installed).
 
 ## Get it
@@ -133,6 +141,19 @@ you ──brief──► Orion (orchestrator)
   engines, from terminal activity. The office simply renders that status.
 - **Spawning**: the orchestrator can start workers by writing `spawn-requests/<id>.json`
   (`name`, `role`, `objective`, optional `cwd`, `provider`).
+
+## Team tab: build production software with a hierarchy
+
+The **Team** tab is the management view.
+
+- **Chain of command.** You > the orchestrator (god) > managers > employees. Every agent has a "reports to" manager (default: the orchestrator). Agents report up; the orchestrator sends you `Report:` messages at milestones, like a manager reporting to a senior. Archiving a manager moves their reports up one level.
+- **Build software.** Describe a product, pick the roles, and **Assemble team & start** hires the missing leads under the right managers and briefs the orchestrator with the GStack playbook. It asks for confirmation first and says how many agent processes it will start.
+- **Crew library.** Ten pre-made leads: Product Lead, Tech Lead, Designer, Frontend Lead, Backend Lead, Code Reviewer, QA Tester, SOC Analyst, Deployment Lead, Tech Writer. Each carries GStack (`/office-hours`, `/plan-eng-review`, `/review`, `/qa`, `/cso`, `/ship`, `/land-and-deploy`, `/canary`, `/retro`) and ECC skill instructions. **Customize** edits the template (name, role, model, effort, autonomy, manager, instructions) and **Reset** restores it.
+- **Customize any hired agent** from the org chart or the Terminal header: rename, model, effort, autonomy, manager, instructions. Model and effort apply live to a running Claude agent; the rest apply on its next start.
+- **Workflow.** Think > Plan > Contract > Build > Review > Test > Secure > Ship > Reflect. The Frontend Lead works with the Designer (visuals, review) and agrees `CONTRACT.md` with the Backend Lead before building. Deployment is gated on QA, review and security, and always needs your approval.
+- **Coding method.** Every agent prompt includes the Cavemen + Ponytail method: minimal tokens (TARGET > INSPECT > IMPLEMENT > TEST > VERIFY) and the smallest correct change (YAGNI, existing code and the standard library first, smallest diff, root-cause fixes).
+
+Status: Implemented. Skill names that are not installed on your machine are skipped by the agents.
 
 ## Autonomy levels
 

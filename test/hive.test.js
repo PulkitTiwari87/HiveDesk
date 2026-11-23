@@ -218,3 +218,215 @@ test('claude launch spec injects prompt, hooks, hive dir and session id', { skip
   const resumed = m.launchSpec({ ...meta, started: true }, { resume: true }).args;
   assert.equal(resumed[resumed.indexOf('--resume') + 1], meta.sessionId);
 });
+
+test('custom command keeps quoted paths and arguments intact', { skip: process.platform !== 'win32' && 'cmd quoting is Windows-specific' }, async () => {
+  const hive = freshHive();
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hd quoted-'));
+  const script = path.join(dir, 'hello.js');
+  fs.writeFileSync(script, 'console.log("CUSTOM_OK " + process.argv.slice(2).join("|")); setTimeout(() => {}, 500);');
+  const meta = hive.addAgent({ name: 'Cleo', provider: 'custom', command: `node "${script}" "two words"`, cwd: dir });
+  const m = new AgentManager({ hive, hookUrl: () => 'http://127.0.0.1:1/x', workspace: dir });
+  assert.ok(m.start(meta).ok);
+  const t0 = Date.now();
+  while (!/CUSTOM_OK/.test(m.replay('cleo')) && Date.now() - t0 < 8000) await new Promise((r) => setTimeout(r, 100));
+  m.stopAll();
+  assert.match(m.replay('cleo'), /CUSTOM_OK two words/, 'quotes survive: the script path (with a space) and the quoted argument arrive whole');
+});
+
+test('Designer preset: standing instructions reach the system prompt', () => {
+  const { PRESETS } = require('../src/main/presets');
+  const hive = freshHive();
+  const meta = hive.addAgent({ ...PRESETS.designer });
+  assert.equal(meta.id, 'designer');
+  assert.equal(meta.effort, 'high');
+  const p = hive.prompt(meta);
+  assert.match(p, /HEAD DESIGNER/);
+  assert.match(p, /"apple-design"/);
+  assert.match(p, /"impeccable"/);
+  assert.ok(!/STANDING INSTRUCTIONS/.test(hive.prompt(hive.addAgent({ name: 'Plain' }))), 'agents without instructions are unchanged');
+});
+
+test('hierarchy: reportsTo defaults to god, survives addAgent, rejects self and loops', () => {
+  const hive = freshHive();
+  const g = hive.addAgent({ id: 'orion', name: 'Orion', isGod: true });
+  const a = hive.addAgent({ name: 'Lead' });
+  const b = hive.addAgent({ name: 'Worker', reportsTo: a.id });
+  assert.equal(g.reportsTo, null);
+  assert.equal(a.reportsTo, 'orion');
+  assert.equal(hive.getAgent(b.id).reportsTo, a.id);
+  assert.equal(hive.addAgent({ name: 'Ghost', reportsTo: 'nobody' }).reportsTo, 'orion', 'unknown manager falls back to god');
+  assert.match(hive.setManager(a.id, a.id), /itself/);
+  assert.match(hive.setManager(a.id, b.id), /loop/, 'a manager cannot report to their own employee');
+  assert.match(hive.setManager('orion', a.id), /reports to you/);
+  assert.equal(hive.setManager(b.id, 'orion'), null);
+  assert.equal(hive.getAgent(b.id).reportsTo, 'orion');
+});
+
+test('hierarchy: archiving a manager moves employees up; prompt names manager and reports', () => {
+  const hive = freshHive();
+  hive.addAgent({ id: 'orion', name: 'Orion', isGod: true });
+  const lead = hive.addAgent({ name: 'Lead', lead: true });
+  const emp = hive.addAgent({ name: 'Emp', reportsTo: lead.id });
+  assert.match(hive.prompt(emp), /you report to lead \(Lead\)/);
+  assert.match(hive.prompt(lead), /Your direct reports: emp \(Emp\)/);
+  assert.match(hive.prompt(lead), /LEAD for your function/);
+  assert.match(hive.prompt(hive.getAgent('orion')), /you report to the human/);
+  assert.match(hive.prompt(hive.getAgent('orion')), /Your direct reports: lead/);
+  hive.archiveAgent(lead.id);
+  assert.equal(hive.getAgent(emp.id).reportsTo, 'orion');
+});
+
+test('manager() and reports() follow reportsTo', () => {
+  const hive = freshHive();
+  hive.addAgent({ id: 'orion', name: 'Orion', isGod: true });
+  const lead = hive.addAgent({ name: 'Lead' });
+  const w = hive.addAgent({ name: 'Helper', reportsTo: lead.id });
+  assert.equal(hive.manager(w.id).id, lead.id);
+  assert.deepEqual(hive.reports(lead.id).map((x) => x.id), [w.id]);
+});
+
+test('presets: every crew preset is complete, uses GStack + ECC, and the chain resolves to god', () => {
+  const { PRESETS, PRODUCTION_TEAM, WORKFLOW, PLAYBOOK, mergedPresets, planTeam } = require('../src/main/presets');
+  for (const [id, p] of Object.entries(PRESETS)) {
+    assert.equal(p.id, id);
+    for (const k of ['name', 'role', 'instructions']) assert.ok(p[k], `${id}.${k}`);
+    assert.ok(p.lead, `${id} is a lead`);
+    assert.match(p.instructions, /GStack/);
+    assert.match(p.instructions, /ecc:/);
+    let cur = id;
+    for (let n = 0; cur !== 'god'; n++) { assert.ok(n < 10 && PRESETS[cur], `${id} chain reaches god`); cur = PRESETS[cur].reportsTo; }
+  }
+  for (const pid of ['product', 'architect', 'designer', 'frontend', 'backend', 'qa', 'security', 'deploy']) assert.ok(PRODUCTION_TEAM.includes(pid), pid);
+  assert.match(PRESETS.security.instructions, /\/cso/);
+  assert.match(PRESETS.qa.instructions, /\/qa/);
+  assert.match(PRESETS.deploy.instructions, /human's explicit approval/);
+  assert.equal(PRESETS.deploy.autonomy, 'ask', 'deployment never defaults to auto-edit');
+  assert.ok(PRODUCTION_TEAM.every((pid, i) => { const m = PRESETS[pid].reportsTo; return m === 'god' || PRODUCTION_TEAM.indexOf(m) < i; }), 'managers are hired before their reports');
+  // The frontend / designer / backend collaboration is spelled out on both sides.
+  assert.match(PRESETS.frontend.instructions, /Designer/);
+  assert.match(PRESETS.frontend.instructions, /CONTRACT\.md/);
+  assert.match(PRESETS.backend.instructions, /Frontend Lead/);
+  assert.match(PRESETS.designer.instructions, /Frontend Lead/);
+  assert.ok(WORKFLOW.every((s) => s.who.every((w) => w === 'god' || PRESETS[w])));
+  assert.match(PLAYBOOK, /report to the human/);
+  // User edits override the template; unknown or non-string values are ignored.
+  const m = mergedPresets({ qa: { name: 'Tess', effort: 'max', model: 5 } });
+  assert.equal(m.qa.name, 'Tess');
+  assert.equal(m.qa.effort, 'max');
+  assert.equal(m.qa.model, '');
+  assert.ok(m.qa.customized && !m.backend.customized);
+  // planTeam: managers first, reuses hired roles, falls back to god.
+  const god = { id: 'orion', isGod: true };
+  const plan = planTeam([god], mergedPresets({}));
+  assert.deepEqual(plan.slice(0, 3).map((h) => [h.presetId, h.reportsTo]), [['product', 'orion'], ['architect', 'orion'], ['designer', 'preset:product']]);
+  const again = planTeam([god, { id: 'my-qa', presetId: 'qa' }], mergedPresets({}));
+  assert.ok(!again.some((h) => h.presetId === 'qa'));
+});
+
+test('every agent prompt (god, worker, preset) carries the Cavemen + Ponytail coding method', () => {
+  const { PRESETS } = require('../src/main/presets');
+  const hive = freshHive();
+  const god = hive.addAgent({ id: 'orion', name: 'Orion', isGod: true });
+  const plain = hive.addAgent({ name: 'Plain' });
+  const { id: _id, ...tpl } = PRESETS.backend;
+  const preset = hive.addAgent({ ...tpl, presetId: 'backend' });
+  for (const a of [god, plain, preset]) {
+    const p = hive.prompt(a);
+    assert.match(p, /CAVEMEN \+ PONYTAIL/, a.name);
+    assert.match(p, /TARGET > INSPECT > IMPLEMENT > TEST > VERIFY/, a.name);
+    assert.match(p, /YAGNI/, a.name);
+    assert.match(p, /standard library first/, a.name);
+    assert.match(p, /smallest working diff/, a.name);
+  }
+});
+
+test('a hired preset keeps its preset id and manager', () => {
+  const { PRESETS } = require('../src/main/presets');
+  const hive = freshHive();
+  hive.addAgent({ id: 'orion', name: 'Orion', isGod: true });
+  const { id: _id, ...tpl } = PRESETS.architect;
+  const arch = hive.addAgent({ ...tpl, presetId: 'architect' });
+  const { id: _i2, ...tpl2 } = PRESETS.frontend;
+  const fe = hive.addAgent({ ...tpl2, presetId: 'frontend', reportsTo: arch.id });
+  assert.equal(fe.presetId, 'frontend');
+  assert.equal(hive.manager(fe.id).id, arch.id);
+  assert.match(hive.prompt(fe), /STANDING INSTRUCTIONS/);
+  assert.match(hive.prompt(fe), /you report to tech-lead \(Tech Lead\)/);
+});
+
+test('claude launch passes --model and --effort', () => {
+  const hive = freshHive();
+  const meta = hive.addAgent({ name: 'Eve', provider: 'claude', command: process.execPath, model: 'opus', effort: 'xhigh' });
+  const m = new AgentManager({ hive, hookUrl: () => 'http://127.0.0.1:1/x', workspace: hive.root });
+  const a = m.launchSpec(meta, { resume: false }).args;
+  assert.equal(a[a.indexOf('--model') + 1], 'opus');
+  assert.equal(a[a.indexOf('--effort') + 1], 'xhigh');
+  const none = m.launchSpec({ ...meta, effort: '', model: '' }, { resume: false }).args;
+  assert.ok(!none.includes('--effort') && !none.includes('--model'));
+});
+
+test('configure: validates, saves, and types /model + /effort only when idle', async () => {
+  const hive = freshHive();
+  const meta = hive.addAgent({ name: 'Fay', provider: 'claude' });
+  const m = new AgentManager({ hive, hookUrl: () => 'http://127.0.0.1:1/x', workspace: hive.root });
+  const writes = [];
+  m.sessions.set('fay', { proc: { write: (d) => writes.push(d) }, status: 'working', notified: new Set(), buf: '' });
+  assert.equal(m.configure('fay', { model: 'bad name; rm -rf' }).ok, false, 'model ids cannot carry spaces or shell text');
+  assert.equal(m.configure('fay', { effort: 'ultra' }).ok, false);
+  assert.equal(m.configure('nope', { model: 'opus' }).ok, false);
+  const busy = m.configure('fay', { model: 'sonnet', effort: 'high' });
+  assert.equal(busy.applied, 'when idle');
+  assert.deepEqual([hive.getAgent('fay').model, hive.getAgent('fay').effort], ['sonnet', 'high'], 'saved for the next start immediately');
+  assert.deepEqual(writes, [], 'nothing typed while the agent is busy');
+  m.setStatus('fay', 'idle');
+  await new Promise((r) => setTimeout(r, 2400));
+  assert.deepEqual(writes, ['/model sonnet', '\r', '/effort high', '\r'], 'slash commands run once it goes idle');
+  assert.equal(m.sessions.get('fay').status, 'idle', 'a slash command does not flip the agent to working');
+  writes.length = 0;
+  assert.equal(m.configure('fay', { effort: 'low' }).applied, 'now');
+  assert.equal(m.configure('fay', { model: 'haiku' }).applied, 'now', 'a second change right after the first');
+  await new Promise((r) => setTimeout(r, 2600));
+  assert.deepEqual(writes, ['/effort low', '\r', '/model haiku', '\r'], 'commands never interleave: each one gets its Enter first');
+  m.stopAll();
+  assert.equal(m.configure('fay', { model: 'haiku' }).applied, 'next start', 'stopped agents just save it');
+});
+
+test('mirror lists and reads Claude Code transcripts (read-only, skips noise and owned sessions)', () => {
+  const { Mirror } = require('../src/main/mirror');
+  const cfg = fs.mkdtempSync(path.join(os.tmpdir(), 'hd-claude-'));
+  const proj = path.join(cfg, 'projects', 'D--Work-demo');
+  fs.mkdirSync(proj, { recursive: true });
+  const line = (o) => JSON.stringify(o);
+  const base = { cwd: path.join(os.tmpdir(), 'demo'), timestamp: '2026-11-23T10:00:00Z' };
+  fs.writeFileSync(path.join(proj, 'sess-a.jsonl'), [
+    line({ ...base, type: 'custom-title', customTitle: 'Fix login' }),
+    line({ ...base, type: 'user', message: { role: 'user', content: 'please fix the login bug' } }),
+    line({ ...base, type: 'user', message: { role: 'user', content: '<system-reminder>ignore me</system-reminder>' } }),
+    line({ ...base, type: 'user', isMeta: true, message: { role: 'user', content: 'meta noise' } }),
+    line({ ...base, type: 'assistant', message: { role: 'assistant', model: 'claude-opus-5-5', content: [{ type: 'thinking', thinking: 'hmm' }, { type: 'text', text: 'On it.' }, { type: 'tool_use', name: 'Edit', input: { file_path: 'src/login.js' } }] } }),
+    line({ ...base, type: 'user', message: { role: 'user', content: [{ type: 'tool_result', content: 'ok' }] } }),
+    line({ ...base, type: 'assistant', isSidechain: true, message: { role: 'assistant', content: [{ type: 'text', text: 'subagent chatter' }] } }),
+    'not json at all',
+  ].join('\n'));
+  fs.writeFileSync(path.join(proj, 'sess-owned.jsonl'), line({ ...base, type: 'user', message: { content: 'mine' } }));
+  fs.writeFileSync(path.join(proj, 'sess-old.jsonl'), line({ ...base, type: 'user', message: { content: 'ancient' } }));
+  const old = new Date(Date.now() - 5 * 24 * 3600 * 1000);
+  fs.utimesSync(path.join(proj, 'sess-old.jsonl'), old, old);
+
+  const prev = process.env.CLAUDE_CONFIG_DIR;
+  process.env.CLAUDE_CONFIG_DIR = cfg;
+  try {
+    const mir = new Mirror();
+    const list = mir.list(new Set(['sess-owned']));
+    assert.deepEqual(list.map((s) => s.id), ['sess-a'], 'old and hivedesk-owned sessions are not listed');
+    assert.deepEqual([list[0].project, list[0].title, list[0].model, list[0].working], ['demo', 'Fix login', 'claude-opus-5-5', true]);
+    const r = mir.read('sess-a');
+    assert.ok(r.ok);
+    assert.deepEqual(r.messages.map((x) => [x.role, x.text]), [['user', 'please fix the login bug'], ['assistant', 'On it.'], ['tool', 'src/login.js']]);
+    assert.equal(r.messages[2].name, 'Edit');
+    assert.equal(mir.read('../../etc/passwd').ok, false, 'only listed session ids can be read');
+    assert.equal(mir.read('sess-old').ok, false);
+  } finally {
+    if (prev === undefined) delete process.env.CLAUDE_CONFIG_DIR; else process.env.CLAUDE_CONFIG_DIR = prev;
+  }
+});

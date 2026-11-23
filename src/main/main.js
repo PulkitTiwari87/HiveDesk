@@ -10,6 +10,9 @@ const crypto = require('node:crypto');
 const { execFile } = require('node:child_process');
 const { Hive, readJson, writeJson } = require('./hive');
 const { AgentManager, PROVIDERS, resolveCommand } = require('./agents');
+const { Mirror } = require('./mirror');
+const { mergedPresets, planTeam, PRODUCTION_TEAM, WORKFLOW, PLAYBOOK } = require('./presets');
+const mirror = new Mirror();
 
 const settingsFile = () => path.join(app.getPath('userData'), 'settings.json');
 const DEFAULT_SETTINGS = {
@@ -21,6 +24,7 @@ const DEFAULT_SETTINGS = {
   godModel: '',
   restoreAgents: true,
   gitCommit: true,
+  presetOverrides: {}, // { <presetId>: { name, role, model, effort, autonomy, instructions, reportsTo } }
 };
 let settings = { ...DEFAULT_SETTINGS, ...readJson(settingsFile(), {}) };
 if (process.env.HIVEDESK_WORKSPACE) settings.workspace = process.env.HIVEDESK_WORKSPACE; // used by tests
@@ -100,7 +104,7 @@ function ensureGod() {
   hive.addAgent({
     id: 'orion',
     name: settings.godName || 'Orion',
-    role: 'Orchestrator. Runs the floor: delegates work, tracks tasks, answers other agents.',
+    role: 'Orchestrator and manager. Runs the team, delegates work, tracks tasks, reports to the human.',
     provider: settings.godProvider,
     autonomy: settings.godAutonomy,
     model: settings.godModel,
@@ -160,6 +164,7 @@ function spawnTick() {
       autonomy: req.autonomy || 'edits',
       cwd: req.cwd || settings.workspace,
       command: req.command || '',
+      reportsTo: req.reportsTo, // validated by the hive: unknown or looping managers fall back to god
     });
     const g = hive.god();
     hive.send({ to: meta.id, act: 'request', subject: 'Your assignment', body: String(req.objective) }, g ? g.id : 'human');
@@ -202,8 +207,95 @@ function registerIpc() {
     hiveRoot: hive.root,
     providers: Object.fromEntries(Object.entries(PROVIDERS).map(([k, v]) => [k, { label: v.label, installed: k === 'custom' || !!resolveCommand(v.bin) }])),
     agents: hive.agents().map(agentView),
+    presets: mergedPresets(settings.presetOverrides),
+    productionTeam: PRODUCTION_TEAM,
+    workflow: WORKFLOW,
     git: gitAvailable,
   }));
+  // Rename / re-role / re-model / re-manage a hired agent. Model and effort apply live (Claude); the rest on the next start.
+  ipcMain.handle('agent:update', (_e, id, p = {}) => {
+    const a = hive.getAgent(id);
+    if (!a || a.archived) return { ok: false, error: 'unknown agent' };
+    const patch = {};
+    if (p.name !== undefined) {
+      const n = String(p.name).trim().slice(0, 40);
+      if (!n) return { ok: false, error: 'Name cannot be empty.' };
+      patch.name = n;
+    }
+    if (p.role !== undefined) patch.role = String(p.role).trim().slice(0, 300);
+    if (p.instructions !== undefined) patch.instructions = String(p.instructions).slice(0, 20000);
+    if (p.autonomy !== undefined) {
+      if (!['ask', 'edits', 'full'].includes(p.autonomy)) return { ok: false, error: 'Autonomy must be ask, edits or full.' };
+      patch.autonomy = p.autonomy;
+    }
+    if (p.reportsTo !== undefined) {
+      const err = hive.setManager(id, p.reportsTo || (hive.god() || {}).id);
+      if (err) return { ok: false, error: err };
+    }
+    const r = agents.configure(id, { model: p.model, effort: p.effort }); // validates, saves, applies live when it can
+    if (!r.ok) return r;
+    if (Object.keys(patch).length) hive.updateAgent(id, patch);
+    hive.log({ type: 'agent-updated', agent: id, fields: Object.keys({ ...patch, ...(p.reportsTo !== undefined ? { reportsTo: 1 } : {}) }) });
+    send('agents:changed');
+    scheduleCommit(`update ${id}`);
+    const restart = !!(patch.name || patch.role || patch.instructions || patch.autonomy || p.reportsTo !== undefined);
+    return { ok: true, applied: r.applied, needsRestart: restart && agents.info(id).status !== 'stopped' };
+  });
+  // Edit a preset template (kept in settings, so it survives restarts and applies to future hires).
+  ipcMain.handle('preset:save', (_e, id, p = {}) => {
+    const base = mergedPresets({})[id];
+    if (!base) return { ok: false, error: 'unknown preset' };
+    const o = {};
+    for (const k of ['name', 'role', 'model', 'effort', 'autonomy', 'instructions', 'reportsTo']) if (typeof p[k] === 'string') o[k] = p[k];
+    if (!String(o.name ?? base.name).trim()) return { ok: false, error: 'Name cannot be empty.' };
+    settings.presetOverrides = { ...settings.presetOverrides, [id]: o };
+    writeJson(settingsFile(), settings);
+    return { ok: true, presets: mergedPresets(settings.presetOverrides) };
+  });
+  ipcMain.handle('preset:reset', (_e, id) => {
+    const rest = { ...settings.presetOverrides };
+    delete rest[id];
+    settings.presetOverrides = rest;
+    writeJson(settingsFile(), settings);
+    return { ok: true, presets: mergedPresets(settings.presetOverrides) };
+  });
+  // "Build software": hire the missing production leads under the orchestrator, then hand it the brief + playbook.
+  ipcMain.handle('team:launch', (_e, { brief, cwd, wanted } = {}) => {
+    const g = hive.god();
+    if (!g) return { ok: false, error: 'No orchestrator. Enable it in Settings first.' };
+    if (!String(brief || '').trim()) return { ok: false, error: 'Describe what to build first.' };
+    const presets = mergedPresets(settings.presetOverrides);
+    const wantList = (Array.isArray(wanted) && wanted.length ? wanted : PRODUCTION_TEAM).filter((x) => presets[x]);
+    const dir = cwd || settings.workspace;
+    const idOf = new Map(hive.agents().filter((a) => a.presetId).map((a) => [a.presetId, a.id]));
+    const hired = [];
+    for (const h of planTeam(hive.agents(), presets, wantList)) {
+      const p = presets[h.presetId];
+      let mgr = h.reportsTo;
+      if (String(mgr).startsWith('preset:')) mgr = idOf.get(mgr.slice(7)) || g.id; // manager not in this batch: report to the orchestrator
+      const { id: _templateId, ...tpl } = p; // never reuse the template id: addAgent would overwrite an archived agent with it
+      const meta = hive.addAgent({ ...tpl, presetId: h.presetId, reportsTo: mgr, cwd: dir });
+      idOf.set(h.presetId, meta.id);
+      agents.start(meta);
+      hired.push(meta.name);
+    }
+    for (const a of hive.agents()) if (a.presetId && wantList.includes(a.presetId) && a.cwd !== dir && !hired.includes(a.name)) hive.updateAgent(a.id, { cwd: dir });
+    const roster = wantList.map((pid) => idOf.get(pid)).filter(Boolean).map((id) => hive.getAgent(id)).map((a) => `- ${a.id} (${a.name}): ${a.role}; reports to ${(hive.manager(a.id) || {}).id || 'you'}`).join('\n');
+    const body = `${String(brief).trim()}\n\nProject folder: ${dir}\n\nYour team (employees, already hired and running):\n${roster}\n\n${PLAYBOOK}`;
+    hive.send({ to: g.id, act: 'request', subject: `Build: ${String(brief).trim().split('\n')[0].slice(0, 70)}`, body }, 'human');
+    agents.maybeWake(g.id);
+    send('agents:changed');
+    scheduleCommit('launch team');
+    return { ok: true, hired };
+  });
+  ipcMain.handle('agent:configure', (_e, id, patch) => {
+    const r = agents.configure(id, patch || {});
+    if (r.ok) send('agents:changed');
+    return r;
+  });
+  // Claude Code chats started anywhere (CLI, desktop app, IDE), read from its own transcripts. Hivedesk's own agents are excluded.
+  ipcMain.handle('mirror:list', () => mirror.list(new Set(hive.agents({ includeArchived: true }).map((a) => a.sessionId))));
+  ipcMain.handle('mirror:read', (_e, id, limit) => mirror.read(id, Math.min(Number(limit) || 200, 500)));
   ipcMain.handle('agents:list', () => hive.agents().map(agentView));
   ipcMain.handle('agent:create', (_e, input) => {
     const meta = hive.addAgent({ ...input, isGod: false });

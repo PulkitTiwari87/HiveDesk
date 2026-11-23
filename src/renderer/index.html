@@ -34,7 +34,9 @@
     <main class="main">
       <nav class="tabs" id="tabs">
         <button data-tab="floor" class="active">Floor</button>
+        <button data-tab="team">Team</button>
         <button data-tab="terminal">Terminal</button>
+        <button data-tab="live">Claude Code <span class="badge hidden" id="liveBadge">0</span></button>
         <button data-tab="tasks">Tasks</button>
         <button data-tab="board">Board</button>
         <button data-tab="memory">Memory</button>
@@ -46,9 +48,53 @@
         <div class="floor" id="floor"></div>
       </section>
 
+      <section class="tab" id="tab-team">
+        <div class="team">
+          <div class="team-main">
+            <div class="team-sec">
+              <h3>Build software</h3>
+              <p class="hint">Describe the product. Hivedesk hires the missing leads under the orchestrator and hands it the GStack playbook. Employees report to their manager, managers to the orchestrator, the orchestrator to you.</p>
+              <textarea id="teamBrief" rows="3" placeholder="e.g. A booking web app for a barbershop: customers pick a slot, owners manage the calendar. React + Node + Postgres."></textarea>
+              <div class="inline"><input id="teamCwd" placeholder="Project folder (defaults to the workspace)"><button type="button" id="teamPick">Browse</button></div>
+              <div id="teamRoles" class="roles"></div>
+              <div class="row-actions"><button class="primary" id="teamLaunch">Assemble team &amp; start</button><span class="hint" id="teamLaunchHint"></span></div>
+            </div>
+            <div class="team-sec">
+              <h3>Org chart</h3>
+              <div id="orgTree" class="org"></div>
+            </div>
+            <div class="team-sec">
+              <h3>Workflow</h3>
+              <div id="workflow" class="workflow"></div>
+            </div>
+          </div>
+          <div class="team-side">
+            <h3>Crew library</h3>
+            <p class="hint">Pre-made leads. Customize edits the template used for future hires; hired agents are customized from the org chart.</p>
+            <div id="crewList" class="crew"></div>
+          </div>
+        </div>
+      </section>
+
       <section class="tab" id="tab-terminal">
         <div class="term-head" id="termHead"></div>
+        <div class="ctl-bar hidden" id="ctlBar"></div>
         <div class="term-wrap" id="termWrap"><div class="empty">Pick an agent on the left.</div></div>
+      </section>
+
+      <section class="tab" id="tab-live">
+        <div class="live">
+          <div class="live-list" id="liveList"><div class="empty small">Looking for Claude Code chats…</div></div>
+          <div class="live-chat">
+            <div class="live-head" id="liveHead"></div>
+            <div class="live-msgs" id="liveMsgs"><div class="empty">Pick a chat on the left.<br><span class="hint">Every Claude Code session you run (terminal, desktop app or IDE) shows up here live, read-only.</span></div></div>
+            <div class="live-delegate hidden" id="liveDelegate">
+              <select id="liveAgent"></select>
+              <input id="liveTask" placeholder="Task for the agent (blank = this chat's last prompt)">
+              <button class="primary" id="liveSend">Delegate to agent</button>
+            </div>
+          </div>
+        </div>
       </section>
 
       <section class="tab" id="tab-tasks">
@@ -102,11 +148,19 @@
   <dialog id="hireDialog">
     <form method="dialog" id="hireForm" class="dialog-form">
       <h2>Hire an agent</h2>
+      <div class="presets" id="hirePresets"></div>
+      <input type="hidden" name="instructions">
+      <input type="hidden" name="presetId">
+      <input type="hidden" name="lead">
+      <input type="hidden" name="reportsTo">
       <label>Name <input name="name" required placeholder="Ada"></label>
       <label>Role <input name="role" placeholder="Frontend engineer: owns the React UI"></label>
       <label>Engine <select name="provider" id="hireProvider"></select></label>
       <label id="hireCommandRow" class="hidden">Command <input name="command" placeholder="aider --model sonnet"></label>
       <label>Model (optional) <input name="model" placeholder="e.g. sonnet, opus, gpt-5"></label>
+      <label>Effort (Claude only)
+        <select name="effort"><option value="">Default</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="xhigh">XHigh</option><option value="max">Max</option></select>
+      </label>
       <label>Autonomy
         <select name="autonomy">
           <option value="ask">Ask before acting</option>
@@ -119,6 +173,25 @@
       </label>
       <label>First task (optional) <textarea name="objective" rows="3" placeholder="Sent to its inbox when it starts"></textarea></label>
       <div class="dialog-actions"><button value="cancel" formnovalidate>Cancel</button><button class="primary" value="ok">Hire</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="customDialog">
+    <form method="dialog" id="customForm" class="dialog-form">
+      <h2 id="customTitle">Customize</h2>
+      <label>Name <input name="name" required maxlength="40"></label>
+      <label>Role <input name="role"></label>
+      <label>Reports to <select name="reportsTo" id="customManager"></select></label>
+      <label>Model <span class="inline"><select id="customModelPick"></select><input name="model" id="customModel" placeholder="or any model id"></span></label>
+      <label>Effort
+        <select name="effort"><option value="">Default</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="xhigh">XHigh</option><option value="max">Max</option></select>
+      </label>
+      <label>Autonomy
+        <select name="autonomy"><option value="ask">Ask before acting</option><option value="edits">Accept file edits</option><option value="full">Full auto (skip permissions)</option></select>
+      </label>
+      <label>Standing instructions <textarea name="instructions" rows="9" spellcheck="false"></textarea></label>
+      <p class="hint" id="customHint"></p>
+      <div class="dialog-actions"><button type="button" id="customReset" class="hidden">Reset to default</button><button value="cancel" formnovalidate>Cancel</button><button class="primary" value="ok">Save</button></div>
     </form>
   </dialog>
 

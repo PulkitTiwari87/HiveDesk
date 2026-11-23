@@ -74,10 +74,10 @@ The harness fills in id, from, hops and created_at.
   Keep the status of the task you work on accurate.
 - Re-reading a message already in .done/ is a no-op. Do not reprocess.
 
-## Spawning a worker (god only)
+## Spawning a worker (god; leads may ask god)
 Write ONE JSON file into spawn-requests/<anything>.json in the hive root:
 \`\`\`json
-{ "name": "Dwight", "role": "what this worker is for", "objective": "the task", "cwd": "C:/abs/path (optional)", "provider": "claude | codex | gemini | copilot (optional)" }
+{ "name": "Dwight", "role": "what this worker is for", "objective": "the task", "reportsTo": "<manager agent id, default god>", "cwd": "C:/abs/path (optional)", "provider": "claude | codex | gemini | copilot (optional)" }
 \`\`\`
 The harness spawns it, delivers the objective to its inbox and moves the request to .done/ (or .failed/ with a reason).
 `;
@@ -132,9 +132,14 @@ class Hive {
       provider: input.provider || 'claude',
       command: input.command || '',
       model: input.model || '',
+      effort: input.effort || '',
+      instructions: input.instructions || '',
       autonomy: input.autonomy || 'edits',
       cwd: input.cwd || '',
       isGod: !!input.isGod,
+      presetId: input.presetId || '',
+      lead: !!input.lead,
+      reportsTo: input.isGod ? null : this.validManager(input.id || '', input.reportsTo, reg),
       sessionId: input.sessionId || crypto.randomUUID(),
       started: false,
       createdAt: new Date().toISOString(),
@@ -160,9 +165,45 @@ class Hive {
 
   archiveAgent(id) {
     const a = this.updateAgent(id, { archived: true });
-    if (a) this.log({ type: 'agent-archived', agent: id });
+    if (a) {
+      // Employees of an archived manager move up to that manager's own manager.
+      const reg = this.registry();
+      const up = this.validManager(id, a.reportsTo, reg);
+      reg.agents.forEach((x) => { if (x.reportsTo === id) x.reportsTo = up; });
+      this.saveRegistry(reg);
+      this.log({ type: 'agent-archived', agent: id });
+    }
     return a;
   }
+
+  // ---------- hierarchy: orchestrator > managers > employees ----------
+  /** Live manager id for `reportsTo`, or the orchestrator when it is missing, archived or would make a cycle. */
+  validManager(id, reportsTo, reg = this.registry()) {
+    const live = reg.agents.filter((a) => !a.archived);
+    const g = live.find((a) => a.isGod);
+    const fallback = g && g.id !== id ? g.id : null;
+    if (!reportsTo || reportsTo === id || !live.some((a) => a.id === reportsTo)) return fallback;
+    for (let cur = reportsTo, n = 0; cur && n < 50; n++) { // walk up: reaching `id` means a cycle
+      if (cur === id) return fallback;
+      const up = live.find((a) => a.id === cur);
+      cur = up ? up.reportsTo : null;
+    }
+    return reportsTo;
+  }
+
+  /** Strict version for the UI: returns an error string or null after saving. */
+  setManager(id, managerId) {
+    const a = this.getAgent(id);
+    if (!a || a.archived) return 'unknown agent';
+    if (a.isGod) return 'The orchestrator reports to you, not to another agent.';
+    if (managerId === id) return 'An agent cannot report to itself.';
+    if (this.validManager(id, managerId) !== managerId) return 'That would create a reporting loop or point to an unknown agent.';
+    this.updateAgent(id, { reportsTo: managerId });
+    return null;
+  }
+
+  manager(id) { const a = this.getAgent(id); return a && !a.isGod ? this.getAgent(this.validManager(id, a.reportsTo)) : null; }
+  reports(id) { return this.agents().filter((a) => !a.isGod && this.validManager(a.id, a.reportsTo) === id); }
 
   ensureAgentFiles(meta) {
     const dir = this.agentDir(meta.id);
@@ -194,11 +235,26 @@ class Hive {
         '(2) DELEGATE: break the human\'s requests into tasks and dispatch them to agents via messages. Prefer an existing agent whose role fits; spawn a worker (spawn-requests/, see PROTOCOL.md) only when none fits.',
         'Write each dispatch as a contract: OBJECTIVE, OUTPUT, TOOLS/REFERENCES, BOUNDARIES + definition of done. Pass file paths, not pasted content.',
         `(3) You are the sole scribe of ${this.p('board.md')} and keep ${this.p('tasks.json')} accurate (set "assignee" when you dispatch).`,
-        'Escalate to the human (a message "to":"human") only for destructive actions, spending money, scope changes or unresolvable conflicts.'
+        'Escalate to the human (a message "to":"human") only for destructive actions, spending money, scope changes or unresolvable conflicts.',
+        'CHAIN OF COMMAND: you report to the human, like a manager reports to their senior. Every other agent is your employee (or an employee of one of your managers) and reports up to you. Collect their reports, then send the human short status reports ("to":"human", "act":"inform", subject starting "Report:") at milestones, when blocked, and when done: done / in progress / risks / what you need from them.'
       );
+      const staff = this.reports(meta.id);
+      if (staff.length) lines.push(`Your direct reports: ${staff.map((a) => `${a.id} (${a.name})`).join(', ')}. Managers among them run their own reports; check ${this.p('registry.json')} for the full tree.`);
     } else {
-      lines.push('For anything ambiguous, cross-cutting or needing sign-off, message "god".');
+      const boss = this.manager(meta.id);
+      const staff = this.reports(meta.id);
+      lines.push(
+        `CHAIN OF COMMAND: you report to ${boss ? `${boss.id} (${boss.name})` : 'the orchestrator'}. Send status updates and your "done" message there. Peers may message you directly for collaboration; escalate ambiguous, cross-cutting or sign-off questions to your manager, and to "god" (the orchestrator) when your manager cannot decide.`,
+      );
+      if (staff.length) lines.push(`Your direct reports: ${staff.map((a) => `${a.id} (${a.name})`).join(', ')}. Delegate to them by message and consolidate their reports for your manager.`);
+      if (meta.lead) lines.push('You are a LEAD for your function. If your lane is overloaded, ask "god" for a worker: write a spawn request (see PROTOCOL.md) with "reportsTo": "' + meta.id + '".');
     }
+    lines.push(
+      'CODING METHOD (every agent that writes code follows it; the orchestrator puts it in every code dispatch): CAVEMEN + PONYTAIL. Load the "caveman" and "ponytail" skills with the Skill tool if installed.',
+      'CAVEMEN = minimum tokens for a correct result: TARGET > INSPECT > IMPLEMENT > TEST > VERIFY. Read only the files the task needs, use targeted searches, do not re-read unchanged files, do not scan the whole repo, plan in a few lines, then implement directly. Keep messages and reports terse: result, files changed, tests run, open risks.',
+      'PONYTAIL (full) = smallest correct change: YAGNI (only what the task needs), reuse existing code first, standard library first, a new dependency only with a concrete reason, smallest working diff, fix root causes not symptoms, explicit readable code, no premature optimization or generalization, no unrelated refactors or formatting churn. Test behavior, run the smallest relevant test first, then broader ones.'
+    );
+    if (meta.instructions) lines.push('STANDING INSTRUCTIONS FOR YOUR ROLE:', meta.instructions);
     lines.push('Env vars available: AGENT_ID, AGENT_NAME, HIVE_ROOT, AGENT_DIR.');
     return lines.join('\n');
   }
